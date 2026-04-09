@@ -1,4 +1,25 @@
 #include "src/include/pfm.h"
+#include <unordered_map>
+#include <cstdint>
+
+namespace {
+    struct HiddenPage {
+        uint32_t readCounter;
+        uint32_t writeCounter;
+        uint32_t appendCounter;
+        uint32_t dataPageCount;   // excludes hidden page
+        // rest of PAGE_SIZE bytes can stay unused
+    };
+
+    struct OpenFileInfo {
+        FILE *filePtr;            
+        HiddenPage meta;
+        bool metaDirty;
+        std::string fileName;
+    };
+
+    std::unordered_map<PeterDB::FileHandle *, OpenFileInfo> g_openFiles;
+}
 
 namespace PeterDB {
     PagedFileManager &PagedFileManager::instance() {
@@ -15,15 +36,69 @@ namespace PeterDB {
     PagedFileManager &PagedFileManager::operator=(const PagedFileManager &) = default;
 
     RC PagedFileManager::createFile(const std::string &fileName) {
-        return -1;
+        std::ifstream infile(fileName);
+        if (infile.good()) {
+            infile.close();
+            return -1; // file already exists
+        }
+        infile.close(); // close stream
+
+        FILE *filePtr = fopen(fileName.c_str(), "wb+");
+        if (filePtr == nullptr) {
+            return -1; // failed to create file
+        }
+
+        // hidden page (page 0)
+        char page[PAGE_SIZE];
+        memset(page, 0, PAGE_SIZE);
+
+        HiddenPage meta{};
+        memcpy(page, &meta, sizeof(HiddenPage));
+
+        size_t written = fwrite(page, 1, PAGE_SIZE, filePtr);
+        fflush(filePtr);
+        fclose(filePtr);
+
+        return (written == PAGE_SIZE) ? 0 : -1; // success if we wrote a full page
     }
 
     RC PagedFileManager::destroyFile(const std::string &fileName) {
-        return -1;
+        for (const auto &entry : g_openFiles) {
+            if (entry.second.fileName == fileName) {
+                return -1; // file is currently open
+            }
+        }
+
+        return (std::remove(fileName.c_str()) == 0) ? 0 : -1; // success if file was removed
     }
 
     RC PagedFileManager::openFile(const std::string &fileName, FileHandle &fileHandle) {
-        return -1;
+        if (g_openFiles.count(&fileHandle) > 0) {
+            return -1; // fileHandle is already in use
+        }
+
+        FILE *filePtr = fopen(fileName.c_str(), "rb+");
+        if (filePtr == nullptr) {
+            return -1; // failed to open file
+        }
+
+        // read hidden page (page 0)
+        char page[PAGE_SIZE];
+        if (fseek(filePtr, 0, SEEK_SET) != 0 || fread(page, 1, PAGE_SIZE, filePtr) != PAGE_SIZE) {
+            fclose(filePtr);
+            return -1; // failed to read hidden page
+        }
+
+        HiddenPage meta{};
+        memcpy(&meta, page, sizeof(HiddenPage));
+
+        // ssync FileHandle counters from persistent metadata
+        fileHandle.readPageCounter = meta.readCounter;
+        fileHandle.writePageCounter = meta.writeCounter;
+        fileHandle.appendPageCounter = meta.appendCounter;
+
+        g_openFiles[&fileHandle] = {filePtr, meta, false, fileName};
+        return 0; // success
     }
 
     RC PagedFileManager::closeFile(FileHandle &fileHandle) {

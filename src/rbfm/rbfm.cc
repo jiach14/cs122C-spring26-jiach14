@@ -15,29 +15,40 @@ namespace PeterDB {
     RecordBasedFileManager &RecordBasedFileManager::operator=(const RecordBasedFileManager &) = default;
 
     RC RecordBasedFileManager::createFile(const std::string &fileName) {
-        return -1;
+        return PagedFileManager::instance().createFile(fileName);
     }
 
     RC RecordBasedFileManager::destroyFile(const std::string &fileName) {
-        return -1;
+        return PagedFileManager::instance().destroyFile(fileName);
     }
 
     RC RecordBasedFileManager::openFile(const std::string &fileName, FileHandle &fileHandle) {
-        return -1;
+        return PagedFileManager::instance().openFile(fileName, fileHandle);
     }
 
     RC RecordBasedFileManager::closeFile(FileHandle &fileHandle) {
-        return -1;
+        return PagedFileManager::instance().closeFile(fileHandle);
     }
 
-    RC RecordBasedFileManager::insertRecord(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
+    RC RecordBasedFileManager::insertRecord(FileHandle &fileHandle, 
+                                            const std::vector<Attribute> &recordDescriptor,
                                             const void *data, RID &rid) {
-        return -1;
+        void *page = malloc(PAGE_SIZE);
+        memset(page, 0, PAGE_SIZE);
+
+        fileHandle.appendPage(page);
+
+        rid.pageNum = fileHandle.getNumberOfPages() - 1;
+        rid.slotNum = 0;
+
+        free(page);
+        return 0;
     }
 
-    RC RecordBasedFileManager::readRecord(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
-                                          const RID &rid, void *data) {
-        return -1;
+    RC RecordBasedFileManager::readRecord(FileHandle &fileHandle, 
+                                        const std::vector<Attribute> &recordDescriptor,
+                                        const RID &rid, void *data) {
+        return fileHandle.readPage(rid.pageNum, data);
     }
 
     RC RecordBasedFileManager::deleteRecord(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
