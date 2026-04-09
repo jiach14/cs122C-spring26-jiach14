@@ -1,6 +1,7 @@
 #include "src/include/pfm.h"
 #include <unordered_map>
 #include <cstdint>
+#include <cstring>
 
 namespace {
     struct HiddenPage {
@@ -102,7 +103,37 @@ namespace PeterDB {
     }
 
     RC PagedFileManager::closeFile(FileHandle &fileHandle) {
-        return -1;
+        auto it = g_openFiles.find(&fileHandle);
+        if (it == g_openFiles.end()) {
+            return -1;
+        }
+
+        OpenFileInfo &info = it->second;
+
+        info.meta.readCounter = fileHandle.readPageCounter;
+        info.meta.writeCounter = fileHandle.writePageCounter;
+        info.meta.appendCounter = fileHandle.appendPageCounter;
+
+        char page[PAGE_SIZE];
+        memset(page, 0, PAGE_SIZE);
+        memcpy(page, &info.meta, sizeof(HiddenPage));
+
+        if (fseek(info.filePtr, 0, SEEK_SET) != 0) {
+            fclose(info.filePtr);
+            g_openFiles.erase(it);
+            return -1;
+        }
+
+        if (fwrite(page, 1, PAGE_SIZE, info.filePtr) != PAGE_SIZE) {
+            fclose(info.filePtr);
+            g_openFiles.erase(it);
+            return -1;
+        }
+
+        fflush(info.filePtr);
+        fclose(info.filePtr);
+        g_openFiles.erase(it);
+        return 0;
     }
 
     FileHandle::FileHandle() {
@@ -114,23 +145,101 @@ namespace PeterDB {
     FileHandle::~FileHandle() = default;
 
     RC FileHandle::readPage(PageNum pageNum, void *data) {
-        return -1;
+        auto it = g_openFiles.find(this);
+        if (it == g_openFiles.end() || data == nullptr) {
+            return -1;
+        }
+
+        OpenFileInfo &info = it->second;
+
+        if (pageNum >= info.meta.dataPageCount) {
+            return -1; // requested page does not exist
+        }
+
+        long offset = static_cast<long>(pageNum + 1) * PAGE_SIZE; // +1 skips hidden page
+        if (fseek(info.filePtr, offset, SEEK_SET) != 0) {
+            return -1;
+        }
+
+        if (fread(data, 1, PAGE_SIZE, info.filePtr) != PAGE_SIZE) {
+            return -1;
+        }
+
+        readPageCounter++;
+        info.metaDirty = true;
+        return 0;
     }
 
     RC FileHandle::writePage(PageNum pageNum, const void *data) {
-        return -1;
+        auto it = g_openFiles.find(this);
+        if (it == g_openFiles.end() || data == nullptr) {
+            return -1;
+        }
+
+        OpenFileInfo &info = it->second;
+
+        if (pageNum >= info.meta.dataPageCount) {
+            return -1; // requested page does not exist
+        }
+
+        long offset = static_cast<long>(pageNum + 1) * PAGE_SIZE; // +1 skips hidden page
+        if (fseek(info.filePtr, offset, SEEK_SET) != 0) {
+            return -1;
+        }
+
+        if (fwrite(data, 1, PAGE_SIZE, info.filePtr) != PAGE_SIZE) {
+            return -1;
+        }
+
+        fflush(info.filePtr);
+        writePageCounter++;
+        info.metaDirty = true;
+        return 0;
     }
 
     RC FileHandle::appendPage(const void *data) {
-        return -1;
+        auto it = g_openFiles.find(this);
+        if (it == g_openFiles.end() || data == nullptr) {
+            return -1;
+        }
+
+        OpenFileInfo &info = it->second;
+
+        if (fseek(info.filePtr, 0, SEEK_END) != 0) {
+            return -1;
+        }
+
+        if (fwrite(data, 1, PAGE_SIZE, info.filePtr) != PAGE_SIZE) {
+            return -1;
+        }
+
+        fflush(info.filePtr);
+
+        appendPageCounter++;
+        info.meta.dataPageCount++;
+        info.metaDirty = true;
+        return 0;
     }
 
     unsigned FileHandle::getNumberOfPages() {
-        return -1;
+        auto it = g_openFiles.find(this);
+        if (it == g_openFiles.end()) {
+            return 0;
+        }
+
+        return it->second.meta.dataPageCount;
     }
 
     RC FileHandle::collectCounterValues(unsigned &readPageCount, unsigned &writePageCount, unsigned &appendPageCount) {
-        return -1;
+        auto it = g_openFiles.find(this);
+        if (it == g_openFiles.end()) {
+            return -1;
+        }
+
+        readPageCount = readPageCounter;
+        writePageCount = writePageCounter;
+        appendPageCount = appendPageCounter;
+        return 0;
     }
 
 } // namespace PeterDB
