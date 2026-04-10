@@ -1,7 +1,17 @@
 #include "src/include/rbfm.h"
 
+#include <cstdint>
+
 namespace {
     using namespace PeterDB;
+
+    // Deleted slots are reusable and should not return records.
+    constexpr int16_t DELETED_SLOT = -1;
+    // Tombstone slots store a forwarding RID for records moved by updateRecord.
+    constexpr int16_t TOMBSTONE_SLOT = -2;
+    constexpr int16_t INVALID_OFFSET = -1;
+    // The project spec defines an RID as 4-byte pageNum + 2-byte slotNum.
+    constexpr int16_t FORWARDING_RID_SIZE = 6;
 
     struct PageHeader {
         uint16_t freeSpaceOffset;
@@ -56,6 +66,36 @@ namespace {
         return slotDirectoryStart - header->freeSpaceOffset;
     }
 
+    inline bool findDeletedSlot(const void *page, uint16_t &slotNum) {
+        const PageHeader *header = getPageHeader(page);
+        for (uint16_t i = 0; i < header->slotCount; i++) {
+            const SlotEntry *slot = getSlotEntry(page, i);
+            if (slot->length == DELETED_SLOT) {
+                slotNum = i;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    inline void writeForwardingRID(void *page, const SlotEntry *slot, const RID &rid) {
+        char *ptr = static_cast<char *>(page) + slot->offset;
+        uint32_t pageNum = static_cast<uint32_t>(rid.pageNum);
+        uint16_t slotNum = static_cast<uint16_t>(rid.slotNum);
+        memcpy(ptr, &pageNum, sizeof(pageNum));
+        memcpy(ptr + sizeof(pageNum), &slotNum, sizeof(slotNum));
+    }
+
+    inline RID readForwardingRID(const void *page, const SlotEntry *slot) {
+        const char *ptr = static_cast<const char *>(page) + slot->offset;
+        uint32_t pageNum = 0;
+        uint16_t slotNum = 0;
+        memcpy(&pageNum, ptr, sizeof(pageNum));
+        memcpy(&slotNum, ptr + sizeof(pageNum), sizeof(slotNum));
+        return RID{pageNum, slotNum};
+    }
+
     uint32_t getRecordSize(const std::vector<Attribute> &recordDescriptor, const void *data) {
         uint32_t fieldCount = static_cast<uint32_t>(recordDescriptor.size());
         uint32_t nullBytes = getNullIndicatorSize(fieldCount);
@@ -89,7 +129,7 @@ namespace {
         return offset;
     }
 
-    int findPageWithSpace(FileHandle &fileHandle, uint32_t neededSpace) {
+    int findPageWithSpace(FileHandle &fileHandle, uint32_t recordSize) {
         unsigned numPages = fileHandle.getNumberOfPages();
         void *page = malloc(PAGE_SIZE);
         if (page == nullptr) {
@@ -99,6 +139,10 @@ namespace {
         if (numPages > 0) {
             PageNum lastPage = numPages - 1;
             if (fileHandle.readPage(lastPage, page) == 0) {
+                uint16_t deletedSlot = 0;
+                uint32_t neededSpace = findDeletedSlot(page, deletedSlot)
+                                       ? recordSize
+                                       : recordSize + sizeof(SlotEntry);
                 if (getFreeSpaceSize(page) >= neededSpace) {
                     free(page);
                     return static_cast<int>(lastPage);
@@ -115,6 +159,10 @@ namespace {
                 continue;
             }
 
+            uint16_t deletedSlot = 0;
+            uint32_t neededSpace = findDeletedSlot(page, deletedSlot)
+                                   ? recordSize
+                                   : recordSize + sizeof(SlotEntry);
             if (getFreeSpaceSize(page) >= neededSpace) {
                 free(page);
                 return static_cast<int>(i);
@@ -168,13 +216,11 @@ namespace PeterDB {
         }
 
         uint32_t recordSize = getRecordSize(recordDescriptor, data);
-        uint32_t neededSpace = recordSize + sizeof(SlotEntry);
-
-        if (neededSpace + sizeof(PageHeader) > PAGE_SIZE) {
+        if (recordSize + sizeof(PageHeader) + sizeof(SlotEntry) > PAGE_SIZE) {
             return -1;
         }
 
-        int targetPageNum = findPageWithSpace(fileHandle, neededSpace);
+        int targetPageNum = findPageWithSpace(fileHandle, recordSize);
 
         void *page = malloc(PAGE_SIZE);
         if (page == nullptr) {
@@ -216,6 +262,7 @@ namespace PeterDB {
 
         PageHeader *header = getPageHeader(page);
         uint16_t slotNum = header->slotCount;
+        bool reuseDeletedSlot = findDeletedSlot(page, slotNum);
 
         memcpy(static_cast<char *>(page) + header->freeSpaceOffset, data, recordSize);
 
@@ -224,7 +271,9 @@ namespace PeterDB {
         slot->length = static_cast<int16_t>(recordSize);
 
         header->freeSpaceOffset = static_cast<uint16_t>(header->freeSpaceOffset + recordSize);
-        header->slotCount = static_cast<uint16_t>(header->slotCount + 1);
+        if (!reuseDeletedSlot) {
+            header->slotCount = static_cast<uint16_t>(header->slotCount + 1);
+        }
 
         if (fileHandle.writePage(static_cast<PageNum>(targetPageNum), page) != 0) {
             free(page);
@@ -264,6 +313,12 @@ namespace PeterDB {
         }
 
         SlotEntry *slot = getSlotEntry(page, rid.slotNum);
+        if (slot->length == TOMBSTONE_SLOT) {
+            RID forwardedRID = readForwardingRID(page, slot);
+            free(page);
+            return readRecord(fileHandle, recordDescriptor, forwardedRID, data);
+        }
+
         if (slot->length <= 0 || slot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
             free(page);
             return -1;
@@ -277,7 +332,39 @@ namespace PeterDB {
 
     RC RecordBasedFileManager::deleteRecord(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
                                             const RID &rid) {
-        return -1;
+        void *page = malloc(PAGE_SIZE);
+        if (page == nullptr) {
+            return -1;
+        }
+
+        if (fileHandle.readPage(rid.pageNum, page) != 0) {
+            free(page);
+            return -1;
+        }
+
+        PageHeader *header = getPageHeader(page);
+        if (rid.slotNum >= header->slotCount) {
+            free(page);
+            return -1;
+        }
+
+        SlotEntry *slot = getSlotEntry(page, rid.slotNum);
+        if (slot->length == DELETED_SLOT || slot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
+            free(page);
+            return -1;
+        }
+
+        if (slot->length == TOMBSTONE_SLOT) {
+            RID forwardedRID = readForwardingRID(page, slot);
+            deleteRecord(fileHandle, recordDescriptor, forwardedRID);
+        }
+
+        slot->offset = INVALID_OFFSET;
+        slot->length = DELETED_SLOT;
+
+        RC rc = fileHandle.writePage(rid.pageNum, page);
+        free(page);
+        return rc;
     }
 
     RC RecordBasedFileManager::printRecord(const std::vector<Attribute> &recordDescriptor, const void *data,
@@ -346,7 +433,77 @@ namespace PeterDB {
 
     RC RecordBasedFileManager::updateRecord(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
                                             const void *data, const RID &rid) {
-        return -1;
+        if (data == nullptr) {
+            return -1;
+        }
+
+        uint32_t recordSize = getRecordSize(recordDescriptor, data);
+        if (recordSize + sizeof(PageHeader) + sizeof(SlotEntry) > PAGE_SIZE) {
+            return -1;
+        }
+
+        void *page = malloc(PAGE_SIZE);
+        if (page == nullptr) {
+            return -1;
+        }
+
+        if (fileHandle.readPage(rid.pageNum, page) != 0) {
+            free(page);
+            return -1;
+        }
+
+        PageHeader *header = getPageHeader(page);
+        if (rid.slotNum >= header->slotCount) {
+            free(page);
+            return -1;
+        }
+
+        SlotEntry *slot = getSlotEntry(page, rid.slotNum);
+        if (slot->length == DELETED_SLOT || slot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
+            free(page);
+            return -1;
+        }
+
+        if (slot->length == TOMBSTONE_SLOT) {
+            RID forwardedRID = readForwardingRID(page, slot);
+            free(page);
+            return updateRecord(fileHandle, recordDescriptor, data, forwardedRID);
+        }
+
+        if (recordSize <= static_cast<uint32_t>(slot->length)) {
+            memcpy(static_cast<char *>(page) + slot->offset, data, recordSize);
+            slot->length = static_cast<int16_t>(recordSize);
+
+            RC rc = fileHandle.writePage(rid.pageNum, page);
+            free(page);
+            return rc;
+        }
+
+        if (slot->length < FORWARDING_RID_SIZE) {
+            free(page);
+            return -1;
+        }
+
+        // Grow the record by inserting the new bytes elsewhere, then leave
+        // this original RID as a tombstone pointing to the new RID.
+        RID forwardedRID;
+        if (insertRecord(fileHandle, recordDescriptor, data, forwardedRID) != 0) {
+            free(page);
+            return -1;
+        }
+
+        if (forwardedRID.pageNum == rid.pageNum && fileHandle.readPage(rid.pageNum, page) != 0) {
+            free(page);
+            return -1;
+        }
+
+        slot = getSlotEntry(page, rid.slotNum);
+        writeForwardingRID(page, slot, forwardedRID);
+        slot->length = TOMBSTONE_SLOT;
+
+        RC rc = fileHandle.writePage(rid.pageNum, page);
+        free(page);
+        return rc;
     }
 
     RC RecordBasedFileManager::readAttribute(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
@@ -362,4 +519,3 @@ namespace PeterDB {
     }
 
 } // namespace PeterDB
-
