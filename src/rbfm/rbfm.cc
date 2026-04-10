@@ -12,6 +12,10 @@ namespace {
     constexpr int16_t INVALID_OFFSET = -1;
     // The project spec defines an RID as 4-byte pageNum + 2-byte slotNum.
     constexpr int16_t FORWARDING_RID_SIZE = 6;
+    constexpr uint32_t INT_FIELD_SIZE = 4;
+    constexpr uint32_t REAL_FIELD_SIZE = 4;
+    constexpr uint32_t VARCHAR_LENGTH_PREFIX_SIZE = 4;
+    constexpr uint32_t FIELD_OFFSET_SIZE = sizeof(uint16_t);
 
     struct PageHeader {
         uint16_t freeSpaceOffset;
@@ -96,7 +100,7 @@ namespace {
         return RID{pageNum, slotNum};
     }
 
-    uint32_t getRecordSize(const std::vector<Attribute> &recordDescriptor, const void *data) {
+    uint32_t getApiRecordSize(const std::vector<Attribute> &recordDescriptor, const void *data) {
         uint32_t fieldCount = static_cast<uint32_t>(recordDescriptor.size());
         uint32_t nullBytes = getNullIndicatorSize(fieldCount);
 
@@ -112,13 +116,15 @@ namespace {
 
             switch (recordDescriptor[i].type) {
                 case TypeInt:
+                    offset += INT_FIELD_SIZE;
+                    break;
                 case TypeReal:
-                    offset += 4;
+                    offset += REAL_FIELD_SIZE;
                     break;
                 case TypeVarChar: {
                     uint32_t len = 0;
-                    memcpy(&len, ptr + offset, 4);
-                    offset += 4 + len;
+                    memcpy(&len, ptr + offset, VARCHAR_LENGTH_PREFIX_SIZE);
+                    offset += VARCHAR_LENGTH_PREFIX_SIZE + len;
                     break;
                 }
                 default:
@@ -127,6 +133,92 @@ namespace {
         }
 
         return offset;
+    }
+
+    inline uint32_t getInternalHeaderSize(uint32_t fieldCount) {
+        return getNullIndicatorSize(fieldCount) + fieldCount * FIELD_OFFSET_SIZE;
+    }
+
+    inline void setFieldEnd(char *record, uint32_t nullBytes, uint32_t fieldNum, uint16_t fieldEnd) {
+        memcpy(record + nullBytes + fieldNum * FIELD_OFFSET_SIZE, &fieldEnd, FIELD_OFFSET_SIZE);
+    }
+
+    inline uint16_t getFieldEnd(const char *record, uint32_t nullBytes, uint32_t fieldNum) {
+        uint16_t fieldEnd = 0;
+        memcpy(&fieldEnd, record + nullBytes + fieldNum * FIELD_OFFSET_SIZE, FIELD_OFFSET_SIZE);
+        return fieldEnd;
+    }
+
+    uint32_t getInternalRecordSize(const std::vector<Attribute> &recordDescriptor, const void *data) {
+        return getInternalHeaderSize(static_cast<uint32_t>(recordDescriptor.size())) +
+               getApiRecordSize(recordDescriptor, data) -
+               getNullIndicatorSize(static_cast<uint32_t>(recordDescriptor.size()));
+    }
+
+    void formatRecordForStorage(const std::vector<Attribute> &recordDescriptor, const void *data, void *record) {
+        uint32_t fieldCount = static_cast<uint32_t>(recordDescriptor.size());
+        uint32_t nullBytes = getNullIndicatorSize(fieldCount);
+        uint32_t dataOffset = getInternalHeaderSize(fieldCount);
+
+        const char *input = static_cast<const char *>(data);
+        char *output = static_cast<char *>(record);
+        const unsigned char *nullIndicator = reinterpret_cast<const unsigned char *>(input);
+
+        memcpy(output, input, nullBytes);
+
+        uint32_t inputOffset = nullBytes;
+
+        // Each end offset lets a field be located directly without scanning prior fields.
+        for (uint32_t i = 0; i < fieldCount; i++) {
+            if (!fieldIsNull(nullIndicator, i)) {
+                uint32_t fieldSize = 0;
+                switch (recordDescriptor[i].type) {
+                    case TypeInt:
+                        fieldSize = INT_FIELD_SIZE;
+                        break;
+                    case TypeReal:
+                        fieldSize = REAL_FIELD_SIZE;
+                        break;
+                    case TypeVarChar: {
+                        uint32_t len = 0;
+                        memcpy(&len, input + inputOffset, VARCHAR_LENGTH_PREFIX_SIZE);
+                        fieldSize = VARCHAR_LENGTH_PREFIX_SIZE + len;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+
+                memcpy(output + dataOffset, input + inputOffset, fieldSize);
+                inputOffset += fieldSize;
+                dataOffset += fieldSize;
+            }
+
+            setFieldEnd(output, nullBytes, i, static_cast<uint16_t>(dataOffset));
+        }
+    }
+
+    void formatRecordForApi(const std::vector<Attribute> &recordDescriptor, const void *record, void *data) {
+        uint32_t fieldCount = static_cast<uint32_t>(recordDescriptor.size());
+        uint32_t nullBytes = getNullIndicatorSize(fieldCount);
+        uint32_t apiOffset = nullBytes;
+
+        const char *input = static_cast<const char *>(record);
+        char *output = static_cast<char *>(data);
+        const unsigned char *nullIndicator = reinterpret_cast<const unsigned char *>(input);
+
+        memcpy(output, input, nullBytes);
+
+        for (uint32_t i = 0; i < fieldCount; i++) {
+            uint32_t fieldStart = (i == 0) ? getInternalHeaderSize(fieldCount) : getFieldEnd(input, nullBytes, i - 1);
+            uint32_t fieldEnd = getFieldEnd(input, nullBytes, i);
+            uint32_t fieldSize = fieldEnd - fieldStart;
+
+            if (!fieldIsNull(nullIndicator, i)) {
+                memcpy(output + apiOffset, input + fieldStart, fieldSize);
+                apiOffset += fieldSize;
+            }
+        }
     }
 
     int findPageWithSpace(FileHandle &fileHandle, uint32_t recordSize) {
@@ -215,15 +307,22 @@ namespace PeterDB {
             return -1;
         }
 
-        uint32_t recordSize = getRecordSize(recordDescriptor, data);
+        uint32_t recordSize = getInternalRecordSize(recordDescriptor, data);
         if (recordSize + sizeof(PageHeader) + sizeof(SlotEntry) > PAGE_SIZE) {
             return -1;
         }
+
+        void *record = malloc(recordSize);
+        if (record == nullptr) {
+            return -1;
+        }
+        formatRecordForStorage(recordDescriptor, data, record);
 
         int targetPageNum = findPageWithSpace(fileHandle, recordSize);
 
         void *page = malloc(PAGE_SIZE);
         if (page == nullptr) {
+            free(record);
             return -1;
         }
 
@@ -234,7 +333,7 @@ namespace PeterDB {
             PageHeader *header = getPageHeader(page);
             uint16_t slotNum = header->slotCount;
 
-            memcpy(static_cast<char *>(page) + header->freeSpaceOffset, data, recordSize);
+            memcpy(static_cast<char *>(page) + header->freeSpaceOffset, record, recordSize);
 
             SlotEntry *slot = getSlotEntry(page, slotNum);
             slot->offset = static_cast<int16_t>(header->freeSpaceOffset);
@@ -244,18 +343,21 @@ namespace PeterDB {
             header->slotCount = static_cast<uint16_t>(header->slotCount + 1);
 
             if (fileHandle.appendPage(page) != 0) {
+                free(record);
                 free(page);
                 return -1;
             }
 
             rid.pageNum = fileHandle.getNumberOfPages() - 1;
             rid.slotNum = slotNum;
+            free(record);
             free(page);
             return 0;
         }
 
         // insert into existing page
         if (fileHandle.readPage(static_cast<PageNum>(targetPageNum), page) != 0) {
+            free(record);
             free(page);
             return -1;
         }
@@ -264,7 +366,7 @@ namespace PeterDB {
         uint16_t slotNum = header->slotCount;
         bool reuseDeletedSlot = findDeletedSlot(page, slotNum);
 
-        memcpy(static_cast<char *>(page) + header->freeSpaceOffset, data, recordSize);
+        memcpy(static_cast<char *>(page) + header->freeSpaceOffset, record, recordSize);
 
         SlotEntry *slot = getSlotEntry(page, slotNum);
         slot->offset = static_cast<int16_t>(header->freeSpaceOffset);
@@ -276,6 +378,7 @@ namespace PeterDB {
         }
 
         if (fileHandle.writePage(static_cast<PageNum>(targetPageNum), page) != 0) {
+            free(record);
             free(page);
             return -1;
         }
@@ -283,6 +386,7 @@ namespace PeterDB {
         rid.pageNum = static_cast<PageNum>(targetPageNum);
         rid.slotNum = slotNum;
 
+        free(record);
         free(page);
         return 0;
     }
@@ -290,8 +394,6 @@ namespace PeterDB {
     RC RecordBasedFileManager::readRecord(FileHandle &fileHandle, 
                                         const std::vector<Attribute> &recordDescriptor,
                                         const RID &rid, void *data) {
-        (void)recordDescriptor;
-
         if (data == nullptr) {
             return -1;
         }
@@ -324,7 +426,7 @@ namespace PeterDB {
             return -1;
         }
 
-        memcpy(data, static_cast<char *>(page) + slot->offset, slot->length);
+        formatRecordForApi(recordDescriptor, static_cast<char *>(page) + slot->offset, data);
 
         free(page);
         return 0;
@@ -396,24 +498,24 @@ namespace PeterDB {
             switch (recordDescriptor[i].type) {
             case TypeInt: {
                     int value = 0;
-                    memcpy(&value, ptr + offset, 4);
-                    offset += 4;
+                    memcpy(&value, ptr + offset, INT_FIELD_SIZE);
+                    offset += INT_FIELD_SIZE;
                     out << value;
                     break;
             }
 
             case TypeReal: {
                     float value = 0.0f;
-                    memcpy(&value, ptr + offset, 4);
-                    offset += 4;
+                    memcpy(&value, ptr + offset, REAL_FIELD_SIZE);
+                    offset += REAL_FIELD_SIZE;
                     out << value;
                     break;
             }
 
             case TypeVarChar: {
                     uint32_t len = 0;
-                    memcpy(&len, ptr + offset, 4);
-                    offset += 4;
+                    memcpy(&len, ptr + offset, VARCHAR_LENGTH_PREFIX_SIZE);
+                    offset += VARCHAR_LENGTH_PREFIX_SIZE;
 
                     std::string s(ptr + offset, ptr + offset + len);
                     offset += len;
@@ -437,49 +539,62 @@ namespace PeterDB {
             return -1;
         }
 
-        uint32_t recordSize = getRecordSize(recordDescriptor, data);
+        uint32_t recordSize = getInternalRecordSize(recordDescriptor, data);
         if (recordSize + sizeof(PageHeader) + sizeof(SlotEntry) > PAGE_SIZE) {
             return -1;
         }
 
+        void *record = malloc(recordSize);
+        if (record == nullptr) {
+            return -1;
+        }
+        formatRecordForStorage(recordDescriptor, data, record);
+
         void *page = malloc(PAGE_SIZE);
         if (page == nullptr) {
+            free(record);
             return -1;
         }
 
         if (fileHandle.readPage(rid.pageNum, page) != 0) {
+            free(record);
             free(page);
             return -1;
         }
 
         PageHeader *header = getPageHeader(page);
         if (rid.slotNum >= header->slotCount) {
+            free(record);
             free(page);
             return -1;
         }
 
         SlotEntry *slot = getSlotEntry(page, rid.slotNum);
         if (slot->length == DELETED_SLOT || slot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
+            free(record);
             free(page);
             return -1;
         }
 
         if (slot->length == TOMBSTONE_SLOT) {
             RID forwardedRID = readForwardingRID(page, slot);
+            free(record);
             free(page);
             return updateRecord(fileHandle, recordDescriptor, data, forwardedRID);
         }
 
         if (recordSize <= static_cast<uint32_t>(slot->length)) {
-            memcpy(static_cast<char *>(page) + slot->offset, data, recordSize);
+            memcpy(static_cast<char *>(page) + slot->offset, record, recordSize);
             slot->length = static_cast<int16_t>(recordSize);
 
             RC rc = fileHandle.writePage(rid.pageNum, page);
+            free(record);
             free(page);
             return rc;
         }
 
         if (slot->length < FORWARDING_RID_SIZE) {
+            free(record);
             free(page);
             return -1;
         }
@@ -488,11 +603,13 @@ namespace PeterDB {
         // this original RID as a tombstone pointing to the new RID.
         RID forwardedRID;
         if (insertRecord(fileHandle, recordDescriptor, data, forwardedRID) != 0) {
+            free(record);
             free(page);
             return -1;
         }
 
         if (forwardedRID.pageNum == rid.pageNum && fileHandle.readPage(rid.pageNum, page) != 0) {
+            free(record);
             free(page);
             return -1;
         }
@@ -502,6 +619,7 @@ namespace PeterDB {
         slot->length = TOMBSTONE_SLOT;
 
         RC rc = fileHandle.writePage(rid.pageNum, page);
+        free(record);
         free(page);
         return rc;
     }
