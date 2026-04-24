@@ -456,11 +456,51 @@ namespace PeterDB {
             return -1;
         }
 
+        int16_t deletedOffset = slot->offset;
+        int16_t deletedLength = slot->length;
         if (slot->length == TOMBSTONE_SLOT) {
             RID forwardedRID = readForwardingRID(page, slot);
-            deleteRecord(fileHandle, recordDescriptor, forwardedRID);
+            if (deleteRecord(fileHandle, recordDescriptor, forwardedRID) != 0) {
+                free(page);
+                return -1;
+            }
+
+            if (forwardedRID.pageNum == rid.pageNum && fileHandle.readPage(rid.pageNum, page) != 0) {
+                free(page);
+                return -1;
+            }
+
+            header = getPageHeader(page);
+            slot = getSlotEntry(page, rid.slotNum);
+            deletedOffset = slot->offset;
+            deletedLength = FORWARDING_RID_SIZE;
         }
 
+
+        int16_t bytesToMove = static_cast<int16_t>(header->freeSpaceOffset - (deletedOffset + deletedLength));
+        if (bytesToMove > 0) {
+            // Close the hole left by the deleted record or tombstone payload.
+            memmove(static_cast<char *>(page) + deletedOffset,                      
+                    static_cast<char *>(page) + deletedOffset + deletedLength,
+                    bytesToMove);
+        }
+
+        for (uint16_t i = 0; i < header->slotCount; i++) {
+            if (i == rid.slotNum) {
+                continue;
+            }
+
+            SlotEntry *otherSlot = getSlotEntry(page, i);
+            if (otherSlot->length == DELETED_SLOT || otherSlot->offset < static_cast<int16_t>(sizeof(PageHeader))) { // skip deleted slots
+                continue;
+            }
+
+            if (otherSlot->offset > deletedOffset) {
+                otherSlot->offset -= deletedLength;
+            }
+        }
+
+        header->freeSpaceOffset -= deletedLength;   // update free space offset after shifting records
         slot->offset = INVALID_OFFSET;
         slot->length = DELETED_SLOT;
 
