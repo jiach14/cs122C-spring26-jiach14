@@ -623,9 +623,95 @@ namespace PeterDB {
             return updateRecord(fileHandle, recordDescriptor, data, forwardedRID);
         }
 
-        if (recordSize <= static_cast<uint32_t>(slot->length)) {
+        int16_t oldOffset = slot->offset;
+        int16_t oldLength = slot->length;
+        int16_t sizeDiff = static_cast<int16_t>(recordSize) - oldLength;
+
+        if (sizeDiff == 0) {
             memcpy(static_cast<char *>(page) + slot->offset, record, recordSize);
+
+            RC rc = fileHandle.writePage(rid.pageNum, page);
+            free(record);
+            free(page);
+            return rc;
+        }
+
+        if (sizeDiff < 0) {
+            memcpy(static_cast<char *>(page) + oldOffset, record, recordSize);
+
+            int16_t shrinkBy = static_cast<int16_t>(-sizeDiff);
+            int16_t moveSrcOffset = static_cast<int16_t>(oldOffset + oldLength);
+            int16_t moveDstOffset = static_cast<int16_t>(oldOffset + recordSize);
+            int16_t bytesToMove = static_cast<int16_t>(header->freeSpaceOffset - moveSrcOffset);
+
+            if (bytesToMove > 0) {
+                // Close the gap left behind when the updated record becomes smaller.
+                memmove(static_cast<char *>(page) + moveDstOffset,
+                        static_cast<char *>(page) + moveSrcOffset,
+                        bytesToMove);
+            }
+
+            for (uint16_t i = 0; i < header->slotCount; i++) {
+                if (i == rid.slotNum) {
+                    continue;
+                }
+
+                SlotEntry *otherSlot = getSlotEntry(page, i);
+                if (otherSlot->length == DELETED_SLOT || otherSlot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
+                    continue;
+                }
+
+                if (otherSlot->offset > oldOffset) {
+                    otherSlot->offset -= shrinkBy;
+                }
+            }
+
+            header->freeSpaceOffset -= shrinkBy;
+            slot = getSlotEntry(page, rid.slotNum);
             slot->length = static_cast<int16_t>(recordSize);
+
+            RC rc = fileHandle.writePage(rid.pageNum, page);
+            free(record);
+            free(page);
+            return rc;
+        }
+
+        uint32_t availableSpace = getFreeSpaceSize(page) + static_cast<uint32_t>(oldLength);
+        if (availableSpace >= recordSize) {
+            int16_t bytesAfterOld = static_cast<int16_t>(header->freeSpaceOffset - (oldOffset + oldLength));
+
+            if (bytesAfterOld > 0) {
+                // Remove the old payload so the enlarged record can be laid out cleanly.
+                memmove(static_cast<char *>(page) + oldOffset,
+                        static_cast<char *>(page) + oldOffset + oldLength,
+                        bytesAfterOld);
+            }
+
+            for (uint16_t i = 0; i < header->slotCount; i++) {
+                if (i == rid.slotNum) {
+                    continue;
+                }
+
+                SlotEntry *otherSlot = getSlotEntry(page, i);
+                if (otherSlot->length == DELETED_SLOT || otherSlot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
+                    continue;
+                }
+
+                if (otherSlot->offset > oldOffset) {
+                    otherSlot->offset -= oldLength;
+                }
+            }
+
+            header->freeSpaceOffset -= oldLength;
+
+            int16_t newOffset = header->freeSpaceOffset;
+            memcpy(static_cast<char *>(page) + newOffset, record, recordSize);
+
+            slot = getSlotEntry(page, rid.slotNum);
+            slot->offset = newOffset;
+            slot->length = static_cast<int16_t>(recordSize);
+
+            header->freeSpaceOffset = static_cast<uint16_t>(header->freeSpaceOffset + recordSize);
 
             RC rc = fileHandle.writePage(rid.pageNum, page);
             free(record);
