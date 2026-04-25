@@ -264,6 +264,173 @@ namespace {
         free(page);
         return -1;
     }
+
+    inline void setNullBit(unsigned char *nullIndicator, uint32_t i) {
+        nullIndicator[i / 8] |= static_cast<unsigned char>(1 << (7 - (i % 8)));
+    }
+
+    void describeApiRecord(const std::vector<Attribute> &recordDescriptor, const void *data,
+                           std::vector<uint32_t> &fieldStarts, std::vector<uint32_t> &fieldSizes,
+                           std::vector<bool> &fieldNulls) {
+        uint32_t fieldCount = static_cast<uint32_t>(recordDescriptor.size());
+        uint32_t nullBytes = getNullIndicatorSize(fieldCount);
+
+        fieldStarts.assign(fieldCount, 0);
+        fieldSizes.assign(fieldCount, 0);
+        fieldNulls.assign(fieldCount, false);
+
+        const char *ptr = static_cast<const char *>(data);
+        const unsigned char *nullIndicator = reinterpret_cast<const unsigned char *>(ptr);
+
+        uint32_t offset = nullBytes;
+        for (uint32_t i = 0; i < fieldCount; i++) {
+            bool isNull = fieldIsNull(nullIndicator, i);
+            fieldNulls[i] = isNull;
+            fieldStarts[i] = offset;
+
+            if (isNull) {
+                continue;
+            }
+
+            switch (recordDescriptor[i].type) {
+                case TypeInt:
+                    fieldSizes[i] = INT_FIELD_SIZE;
+                    offset += INT_FIELD_SIZE;
+                    break;
+                case TypeReal:
+                    fieldSizes[i] = REAL_FIELD_SIZE;
+                    offset += REAL_FIELD_SIZE;
+                    break;
+                case TypeVarChar: {
+                    uint32_t len = 0;
+                    memcpy(&len, ptr + offset, VARCHAR_LENGTH_PREFIX_SIZE);
+                    fieldSizes[i] = VARCHAR_LENGTH_PREFIX_SIZE + len;
+                    offset += fieldSizes[i];
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+
+    uint32_t getPredicateValueSize(const Attribute &attribute, const void *value) {
+        if (value == nullptr) {
+            return 0;
+        }
+
+        switch (attribute.type) {
+            case TypeInt:
+                return INT_FIELD_SIZE;
+            case TypeReal:
+                return REAL_FIELD_SIZE;
+            case TypeVarChar: {
+                uint32_t len = 0;
+                memcpy(&len, value, VARCHAR_LENGTH_PREFIX_SIZE);
+                return VARCHAR_LENGTH_PREFIX_SIZE + len;
+            }
+            default:
+                return 0;
+        }
+    }
+
+    bool compareFieldData(AttrType type, const void *lhs, const void *rhs, CompOp compOp) {
+        if (compOp == NO_OP) {
+            return true;
+        }
+
+        int comparison = 0;
+        switch (type) {
+            case TypeInt: {
+                int left = 0;
+                int right = 0;
+                memcpy(&left, lhs, INT_FIELD_SIZE);
+                memcpy(&right, rhs, INT_FIELD_SIZE);
+                comparison = (left < right) ? -1 : (left > right ? 1 : 0);
+                break;
+            }
+            case TypeReal: {
+                float left = 0.0f;
+                float right = 0.0f;
+                memcpy(&left, lhs, REAL_FIELD_SIZE);
+                memcpy(&right, rhs, REAL_FIELD_SIZE);
+                comparison = (left < right) ? -1 : (left > right ? 1 : 0);
+                break;
+            }
+            case TypeVarChar: {
+                uint32_t leftLen = 0;
+                uint32_t rightLen = 0;
+                memcpy(&leftLen, lhs, VARCHAR_LENGTH_PREFIX_SIZE);
+                memcpy(&rightLen, rhs, VARCHAR_LENGTH_PREFIX_SIZE);
+
+                std::string left(static_cast<const char *>(lhs) + VARCHAR_LENGTH_PREFIX_SIZE, leftLen);
+                std::string right(static_cast<const char *>(rhs) + VARCHAR_LENGTH_PREFIX_SIZE, rightLen);
+                comparison = (left < right) ? -1 : (left > right ? 1 : 0);
+                break;
+            }
+            default:
+                return false;
+        }
+
+        switch (compOp) {
+            case EQ_OP:
+                return comparison == 0;
+            case LT_OP:
+                return comparison < 0;
+            case LE_OP:
+                return comparison <= 0;
+            case GT_OP:
+                return comparison > 0;
+            case GE_OP:
+                return comparison >= 0;
+            case NE_OP:
+                return comparison != 0;
+            case NO_OP:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool recordMatchesCondition(const std::vector<Attribute> &recordDescriptor, uint32_t conditionIndex, CompOp compOp,
+                                const void *value, const std::vector<uint32_t> &fieldStarts,
+                                const std::vector<uint32_t> &fieldSizes, const std::vector<bool> &fieldNulls,
+                                const void *recordData) {
+        if (compOp == NO_OP || conditionIndex >= recordDescriptor.size()) {
+            return true;
+        }
+
+        if (value == nullptr || fieldNulls[conditionIndex]) {
+            return false;
+        }
+
+        const char *recordPtr = static_cast<const char *>(recordData);
+        return compareFieldData(recordDescriptor[conditionIndex].type,
+                                recordPtr + fieldStarts[conditionIndex], value, compOp);
+    }
+
+    void projectApiRecord(const std::vector<Attribute> &recordDescriptor, const std::vector<uint32_t> &projectedIndices,
+                          const std::vector<uint32_t> &fieldStarts, const std::vector<uint32_t> &fieldSizes,
+                          const std::vector<bool> &fieldNulls, const void *recordData, void *outputData) {
+        uint32_t projectedCount = static_cast<uint32_t>(projectedIndices.size());
+        uint32_t outputNullBytes = getNullIndicatorSize(projectedCount);
+        auto *output = static_cast<char *>(outputData);
+        memset(output, 0, outputNullBytes);
+
+        const char *input = static_cast<const char *>(recordData);
+        uint32_t outputOffset = outputNullBytes;
+
+        for (uint32_t i = 0; i < projectedCount; i++) {
+            uint32_t sourceIndex = projectedIndices[i];
+            if (sourceIndex >= recordDescriptor.size() || fieldNulls[sourceIndex]) {
+                setNullBit(reinterpret_cast<unsigned char *>(output), i);
+                continue;
+            }
+
+            memcpy(output + outputOffset, input + fieldStarts[sourceIndex], fieldSizes[sourceIndex]);
+            outputOffset += fieldSizes[sourceIndex];
+        }
+    }
 }
 
 
@@ -752,14 +919,230 @@ namespace PeterDB {
 
     RC RecordBasedFileManager::readAttribute(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
                                              const RID &rid, const std::string &attributeName, void *data) {
-        return -1;
+        if (data == nullptr) {
+            return -1;
+        }
+
+        uint32_t fieldCount = static_cast<uint32_t>(recordDescriptor.size());
+        uint32_t targetIndex = fieldCount;
+        for (uint32_t i = 0; i < fieldCount; i++) {
+            if (recordDescriptor[i].name == attributeName) {
+                targetIndex = i;
+                break;
+            }
+        }
+
+        if (targetIndex == fieldCount) { // attributeName is not in the record descriptor
+            return -1;
+        }
+
+        void *page = malloc(PAGE_SIZE);
+        if (page == nullptr) {
+            return -1;
+        }
+
+        if (fileHandle.readPage(rid.pageNum, page) != 0) {
+            free(page);
+            return -1;
+        }
+
+        PageHeader *header = getPageHeader(page);
+        if (rid.slotNum >= header->slotCount) {
+            free(page);
+            return -1;
+        }
+
+        SlotEntry *slot = getSlotEntry(page, rid.slotNum);
+        if (slot->length == DELETED_SLOT || slot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
+            free(page);
+            return -1;
+        }
+
+        if (slot->length == TOMBSTONE_SLOT) {   // Follow the forwarding RID to the updated record.
+            RID forwardedRID = readForwardingRID(page, slot);
+            free(page);
+            return readAttribute(fileHandle, recordDescriptor, forwardedRID, attributeName, data);
+        }
+
+        char *output = static_cast<char *>(data);
+        output[0] = 0;
+
+        const char *record = static_cast<const char *>(page) + slot->offset;
+        uint32_t nullBytes = getNullIndicatorSize(fieldCount);
+        const unsigned char *nullIndicator = reinterpret_cast<const unsigned char *>(record);
+
+        if (fieldIsNull(nullIndicator, targetIndex)) {
+            output[0] = (1 << 7);
+            free(page);
+            return 0;
+        }
+
+        uint32_t fieldStart = (targetIndex == 0)
+                              ? getInternalHeaderSize(fieldCount)
+                              : getFieldEnd(record, nullBytes, targetIndex - 1);
+        uint32_t fieldEnd = getFieldEnd(record, nullBytes, targetIndex);
+        uint32_t fieldSize = fieldEnd - fieldStart;
+
+        memcpy(output + 1, record + fieldStart, fieldSize);
+
+        free(page);
+        return 0;
+
     }
 
     RC RecordBasedFileManager::scan(FileHandle &fileHandle, const std::vector<Attribute> &recordDescriptor,
                                     const std::string &conditionAttribute, const CompOp compOp, const void *value,
                                     const std::vector<std::string> &attributeNames,
                                     RBFM_ScanIterator &rbfm_ScanIterator) {
-        return -1;
+        rbfm_ScanIterator.close();
+
+        uint32_t fieldCount = static_cast<uint32_t>(recordDescriptor.size());
+
+        rbfm_ScanIterator.fileHandle = &fileHandle;
+        rbfm_ScanIterator.recordDescriptor = recordDescriptor;
+        rbfm_ScanIterator.conditionAttribute = conditionAttribute;
+        rbfm_ScanIterator.compOp = compOp;
+        rbfm_ScanIterator.projectedAttributeNames = attributeNames;
+        rbfm_ScanIterator.projectedIndices.clear();
+        rbfm_ScanIterator.conditionIndex = fieldCount;
+        rbfm_ScanIterator.currentPage = 0;
+        rbfm_ScanIterator.currentSlot = 0;
+        rbfm_ScanIterator.value = nullptr;
+        rbfm_ScanIterator.valueSize = 0;
+        rbfm_ScanIterator.isOpen = true;
+
+        if (compOp != NO_OP && !conditionAttribute.empty()) {
+            for (uint32_t i = 0; i < fieldCount; i++) {
+                if (recordDescriptor[i].name == conditionAttribute) {
+                    rbfm_ScanIterator.conditionIndex = i;
+                    break;
+                }
+            }
+
+            if (rbfm_ScanIterator.conditionIndex == fieldCount) {
+                rbfm_ScanIterator.close();
+                return -1;
+            }
+
+            rbfm_ScanIterator.valueSize = getPredicateValueSize(
+                recordDescriptor[rbfm_ScanIterator.conditionIndex], value
+            );
+
+            if (rbfm_ScanIterator.valueSize == 0 || value == nullptr) {
+                rbfm_ScanIterator.close();
+                return -1;
+            }
+
+            rbfm_ScanIterator.value = malloc(rbfm_ScanIterator.valueSize);
+            if (rbfm_ScanIterator.value == nullptr) {
+                rbfm_ScanIterator.close();
+                return -1;
+            }
+            memcpy(rbfm_ScanIterator.value, value, rbfm_ScanIterator.valueSize);
+        }
+
+        for (const std::string &attributeName : attributeNames) {
+            bool found = false;
+            for (uint32_t i = 0; i < fieldCount; i++) {
+                if (recordDescriptor[i].name == attributeName) {
+                    rbfm_ScanIterator.projectedIndices.push_back(i);
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                rbfm_ScanIterator.close();
+                return -1;
+            }
+        }
+
+        return 0;
+    }
+
+    RC RBFM_ScanIterator::getNextRecord(RID &rid, void *data) {
+        if (!isOpen || fileHandle == nullptr || data == nullptr) {
+            return RBFM_EOF;
+        }
+
+        void *page = malloc(PAGE_SIZE);
+        void *recordData = malloc(PAGE_SIZE);
+        if (page == nullptr || recordData == nullptr) {
+            free(page);
+            free(recordData);
+            return -1;
+        }
+
+        std::vector<uint32_t> fieldStarts;
+        std::vector<uint32_t> fieldSizes;
+        std::vector<bool> fieldNulls;
+
+        unsigned numPages = fileHandle->getNumberOfPages();
+        while (currentPage < numPages) {
+            if (fileHandle->readPage(currentPage, page) != 0) {
+                free(page);
+                free(recordData);
+                return -1;
+            }
+
+            PageHeader *header = getPageHeader(page);
+            while (currentSlot < header->slotCount) {
+                uint16_t slotNum = currentSlot++;
+                SlotEntry *slot = getSlotEntry(page, slotNum);
+                if (slot->length == DELETED_SLOT || slot->offset < static_cast<int16_t>(sizeof(PageHeader))) {
+                    continue;
+                }
+
+                if (slot->length == TOMBSTONE_SLOT) {
+                    continue;
+                }
+
+                RID candidateRID{currentPage, slotNum};
+                if (RecordBasedFileManager::instance().readRecord(*fileHandle, recordDescriptor, candidateRID, recordData) != 0) {
+                    continue;
+                }
+
+                describeApiRecord(recordDescriptor, recordData, fieldStarts, fieldSizes, fieldNulls);
+                if (!recordMatchesCondition(recordDescriptor, conditionIndex, compOp, value,
+                                            fieldStarts, fieldSizes, fieldNulls, recordData)) {
+                    continue;
+                }
+
+                projectApiRecord(recordDescriptor, projectedIndices, fieldStarts, fieldSizes, fieldNulls,
+                                 recordData, data);
+                rid = candidateRID;
+                free(page);
+                free(recordData);
+                return 0;
+            }
+
+            currentPage++;
+            currentSlot = 0;
+        }
+
+        free(page);
+        free(recordData);
+        return RBFM_EOF;
+    }
+
+    RC RBFM_ScanIterator::close() {
+        if (value != nullptr) {
+            free(value);
+            value = nullptr;
+        }
+
+        fileHandle = nullptr;
+        recordDescriptor.clear();
+        conditionAttribute.clear();
+        projectedAttributeNames.clear();
+        projectedIndices.clear();
+        conditionIndex = 0;
+        compOp = NO_OP;
+        currentPage = 0;
+        currentSlot = 0;
+        valueSize = 0;
+        isOpen = false;
+        return 0;
     }
 
 } // namespace PeterDB

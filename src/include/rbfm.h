@@ -2,6 +2,7 @@
 #define _rbfm_h_
 
 #include <vector>
+#include <cstdint>
 #include <cstring> // for memset
 
 #include "pfm.h"
@@ -62,9 +63,30 @@ namespace PeterDB {
         // Never keep the results in the memory. When getNextRecord() is called,
         // a satisfying record needs to be fetched from the file.
         // "data" follows the same format as RecordBasedFileManager::insertRecord().
-        RC getNextRecord(RID &rid, void *data) { return RBFM_EOF; };
+        RC getNextRecord(RID &rid, void *data);
 
-        RC close() { return -1; };
+        RC close();
+
+    private:
+        friend class RecordBasedFileManager;
+
+        FileHandle *fileHandle = nullptr;
+        std::vector<Attribute> recordDescriptor;
+
+        std::string conditionAttribute;
+        CompOp compOp = NO_OP;
+        std::vector<std::string> projectedAttributeNames;
+
+        uint32_t conditionIndex = 0;
+        std::vector<uint32_t> projectedIndices;
+
+        unsigned currentPage = 0;
+        unsigned short currentSlot = 0;
+
+        void *value = nullptr;
+        uint32_t valueSize = 0;
+
+        bool isOpen = false;
     };
 
     class RecordBasedFileManager {
