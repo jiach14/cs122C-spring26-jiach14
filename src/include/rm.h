@@ -13,13 +13,17 @@ namespace PeterDB {
     class RM_ScanIterator {
     public:
         RM_ScanIterator();
-
         ~RM_ScanIterator();
 
-        // "data" follows the same format as RelationManager::insertTuple()
         RC getNextTuple(RID &rid, void *data);
-
         RC close();
+
+    private:
+        friend class RelationManager;
+
+        RBFM_ScanIterator rbfmIterator;
+        FileHandle fileHandle;
+        bool isOpen = false;
     };
 
     // RM_IndexScanIterator is an iterator to go through index entries
