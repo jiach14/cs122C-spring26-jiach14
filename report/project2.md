@@ -6,8 +6,8 @@
  - Github Repo Link: https://github.com/jiach14/cs122C-spring26-jiach14
  - Student 1 UCI NetID: songhag
  - Student 1 Name: songhao gao
- - Student 2 UCI NetID (if applicable):
- - Student 2 Name (if applicable):
+ - Student 2 UCI NetID (if applicable): jiach14
+ - Student 2 Name (if applicable): Jason He
 
 ### 2. Meta-data
 - Show your meta-data design (Tables and Columns table) and information about each column.
