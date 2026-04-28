@@ -142,7 +142,7 @@ Special values for length:
 ### 8. Member contribution (for team of two)
 - Explain how you distribute the workload in team.
   - songhao: Implemented RBFM functions (deleteRecord, updateRecord, readAttribute, scan) and page management logic
-  - jason: 
+  - Jason: Implemented and debugged the RBFM record format and page/slot lifecycle, including deleteRecord, updateRecord with tombstones, readAttribute, scan iterator logic, and initial RM catalog creation helpers.
   - Both collaborated on debugging, testing, and final integration of the system.
 
 
