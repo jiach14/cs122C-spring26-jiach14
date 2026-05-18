@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <string>
+#include <cstdint>
 
 #include "pfm.h"
 #include "rbfm.h" // for some type declarations only, e.g., RID and Attribute
@@ -71,6 +72,26 @@ namespace PeterDB {
 
         // Terminate index scan
         RC close();
+
+    public:
+        friend class IndexManager;
+
+        IXFileHandle *ixFileHandle = nullptr;
+        Attribute attribute;
+
+        std::vector<char> lowKey;
+        std::vector<char> highKey;
+        bool hasLowKey = false;
+        bool hasHighKey = false;
+        bool lowKeyInclusive = true;
+        bool highKeyInclusive = true;
+
+        PageNum currentLeafPage = 0;
+        uint32_t currentEntryIndex = 0;
+        std::vector<char> lastKey;
+        RID lastRid{};
+        bool hasLastReturned = false;
+        bool isOpen = false;
     };
 
     class IXFileHandle {
@@ -89,6 +110,13 @@ namespace PeterDB {
 
         // Put the current counter values of associated PF FileHandles into variables
         RC collectCounterValues(unsigned &readPageCount, unsigned &writePageCount, unsigned &appendPageCount);
+
+    public:
+        friend class IndexManager;
+        friend class IX_ScanIterator;
+
+        FileHandle fileHandle;
+        bool isOpen = false;
 
     };
 }// namespace PeterDB
