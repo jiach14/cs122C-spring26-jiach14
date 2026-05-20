@@ -604,7 +604,7 @@ namespace PeterDB {
                 lastKey = entry.key;
                 lastRid = entry.rid;
                 hasLastReturned = true;
-                currentEntryIndex = static_cast<uint32_t>(i + 1);
+                currentEntryIndex = static_cast<uint32_t>(i);
                 return 0;
             }
 
