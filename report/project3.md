@@ -138,7 +138,8 @@ None
 
 ### 7. Member contribution (for team of two)
 - Explain how you distribute the workload in team.
-we collaborate together online, updating the code, and wrote the report.
+  We worked together online throughout the project. Both members contributed to debugging, 
+  implementing the IX component, running the test cases, and writing the report.
 
 
 ### 8. Other (optional)
