@@ -272,6 +272,14 @@ namespace {
         return i;
     }
 
+    uint32_t chooseChildForDelete(const PeterDB::Attribute &attribute,
+                          const Node &node,
+                          const std::vector<char> &key) {
+        uint32_t i = 0;
+        while (i < node.keys.size() && compareKey(attribute, key, node.keys[i]) > 0) ++i;
+        return i;
+    }
+
     void sortLeafEntries(const PeterDB::Attribute &attribute, std::vector<LeafEntry> &entries) {
         std::sort(entries.begin(), entries.end(), [&](const LeafEntry &a, const LeafEntry &b) {
             return compareEntry(attribute, a, b) < 0;
@@ -453,8 +461,7 @@ namespace PeterDB {
         return 0;
     }
 
-    RC
-    IndexManager::insertEntry(IXFileHandle &ixFileHandle, const Attribute &attribute, const void *key, const RID &rid) {
+    RC IndexManager::insertEntry(IXFileHandle &ixFileHandle, const Attribute &attribute, const void *key, const RID &rid) {
         if (!ixFileHandle.isOpen || key == nullptr) return -1;
 
         LeafEntry entry;
@@ -501,37 +508,59 @@ namespace PeterDB {
         return writeMeta(ixFileHandle, meta);
     }
 
-    RC
-    IndexManager::deleteEntry(IXFileHandle &ixFileHandle, const Attribute &attribute, const void *key, const RID &rid) {
+
+    RC IndexManager::deleteEntry(IXFileHandle &ixFileHandle,
+                                 const Attribute &attribute,
+                                 const void *key,
+                                 const RID &rid) {
         if (!ixFileHandle.isOpen || key == nullptr) return -1;
+
         MetaPage meta;
         if (readMeta(ixFileHandle, meta) != 0 || !meta.initialized) return -1;
 
         const std::vector<char> targetKey = copyKey(attribute, key);
-        PeterDB::PageNum page = meta.rootPage;
-        Node cursor;
-        while (readNode(ixFileHandle, page, cursor) == 0 && !cursor.isLeaf) {
-            page = cursor.children.front();
+
+        PageNum page = meta.rootPage;
+        Node node;
+
+        while (true) {
+            if (readNode(ixFileHandle, page, node) != 0) return -1;
+
+            if (node.isLeaf) break;
+
+            uint32_t childIndex = chooseChild(attribute, node, targetKey);
+            if (childIndex >= node.children.size()) return -1;
+
+            page = node.children[childIndex];
         }
+
         while (page != INVALID_PAGE) {
-            Node leaf;
-            if (cursor.isLeaf && page == meta.rootPage) {
-                leaf = cursor;
-            } else if (readNode(ixFileHandle, page, leaf) != 0 || !leaf.isLeaf) {
-                return -1;
-            }
+            Node leaf = node;
+
+            if (!leaf.isLeaf) return -1;
 
             for (auto it = leaf.entries.begin(); it != leaf.entries.end(); ++it) {
                 const int cmp = compareKey(attribute, it->key, targetKey);
+
                 if (cmp > 0) return -1;
+
                 if (cmp == 0 && sameRid(it->rid, rid)) {
                     leaf.entries.erase(it);
                     return writeNode(ixFileHandle, page, leaf);
                 }
             }
+
+            if (!leaf.entries.empty()) {
+                const int lastCmp = compareKey(attribute, leaf.entries.back().key, targetKey);
+                if (lastCmp > 0) return -1;
+            }
+
             page = leaf.nextLeaf;
-            cursor = Node{};
+            if (page == INVALID_PAGE) break;
+
+            if (readNode(ixFileHandle, page, node) != 0) return -1;
         }
+
         return -1;
     }
 
@@ -645,5 +674,7 @@ namespace PeterDB {
         ixAppendPageCounter = appendPageCount;
         return 0;
     }
+
+
 
 } // namespace PeterDB

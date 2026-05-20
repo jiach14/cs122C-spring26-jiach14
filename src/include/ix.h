@@ -4,6 +4,8 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <ostream>
+#include <limits>
 
 #include "pfm.h"
 #include "rbfm.h" // for some type declarations only, e.g., RID and Attribute
@@ -86,7 +88,7 @@ namespace PeterDB {
         bool lowKeyInclusive = true;
         bool highKeyInclusive = true;
 
-        PageNum currentLeafPage = 0;
+        PageNum currentLeafPage = std::numeric_limits<PageNum>::max();
         uint32_t currentEntryIndex = 0;
         std::vector<char> lastKey;
         RID lastRid{};
