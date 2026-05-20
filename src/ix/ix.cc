@@ -528,7 +528,7 @@ namespace PeterDB {
 
             if (node.isLeaf) break;
 
-            uint32_t childIndex = chooseChild(attribute, node, targetKey);
+            uint32_t childIndex = chooseChildForDelete(attribute, node, targetKey);
             if (childIndex >= node.children.size()) return -1;
 
             page = node.children[childIndex];
