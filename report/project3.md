@@ -104,7 +104,21 @@
 
 
 - Merge/non-lazy deletion (if applicable)
-  None
+  The basic delete operation first finds the exact <key, RID> pair and removes
+  it from the leaf page.
+
+  For extra credit, I added a compact rebuild path for small trees after a
+  deletion. If the index is small enough, the implementation scans the current
+  leaf chain, collects the remaining entries, and rebuilds a compact B+ Tree
+  from those entries. This removes underfilled pages from the active tree and
+  can shrink the height of the tree. For example, if a height-2 tree can be
+  represented as a height-1 tree after deletion, the metadata rootPage is
+  updated to point to the new compact root. If only one entry remains, the new
+  root is a leaf page and the height becomes 0.
+
+  For large indexes, the implementation keeps the lazy-deletion behavior and
+  does not rebuild after every deletion. This avoids making scan-delete tests
+  too slow for large data sets.
 
 
 - Duplicate key span in a page
@@ -122,18 +136,27 @@
 
 
 - Duplicate key span multiple pages (if applicable)
-None
+  Duplicate keys can span multiple leaf pages. The entries are still stored as
+  individual <key, RID> pairs, and the leaf next pointers allow scans to keep
+  walking through all pages that contain matching keys.
+
+  The scan iterator keeps track of the last returned key/RID and the leaf page
+  it came from. This lets the iterator continue correctly even if the caller
+  deletes the entry that was just returned. If the entry is gone when
+  getNextEntry() is called again, the iterator adjusts its page-local position
+  and returns the next valid entry instead of skipping one.
 
 ### 6. Implementation Detail
 - Have you added your own module or source file (.cc or .h)? 
   Clearly list the changes on files and CMakeLists.txt, if any.
-  None
+  No new source files or CMake changes were added.
 
 
 - Other implementation details:
   only modified the existing IX files:
   src/include/ix.h
   src/ix/ix.cc
+  report/project3.md
 
 
 ### 7. Member contribution (for team of two)

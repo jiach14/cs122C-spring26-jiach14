@@ -37,6 +37,14 @@ namespace {
         PeterDB::PageNum rightPage = INVALID_PAGE;
     };
 
+    struct LevelItem {
+        PeterDB::PageNum page = INVALID_PAGE;
+        std::vector<char> firstKey;
+
+        LevelItem() = default;
+        LevelItem(PeterDB::PageNum page, const std::vector<char> &firstKey) : page(page), firstKey(firstKey) {}
+    };
+
     uint16_t readUInt16(const char *page, size_t &offset) {
         uint16_t value;
         std::memcpy(&value, page + offset, sizeof(value));
@@ -370,6 +378,134 @@ namespace {
         return page;
     }
 
+    PeterDB::RC collectSmallTreeEntries(PeterDB::IXFileHandle &handle, PeterDB::PageNum rootPage,
+                                        size_t limit, std::vector<LeafEntry> &entries, bool &tooLarge) {
+        entries.clear();
+        tooLarge = false;
+
+        PeterDB::PageNum page = leftmostLeaf(handle, rootPage);
+        while (page != INVALID_PAGE) {
+            Node leaf;
+            if (readNode(handle, page, leaf) != 0 || !leaf.isLeaf) return -1;
+
+            for (const LeafEntry &entry: leaf.entries) {
+                entries.push_back(entry);
+                if (entries.size() > limit) {
+                    tooLarge = true;
+                    return 0;
+                }
+            }
+            page = leaf.nextLeaf;
+        }
+        return 0;
+    }
+
+    PeterDB::RC rebuildCompactTree(PeterDB::IXFileHandle &handle, const PeterDB::Attribute &attribute,
+                                   const std::vector<LeafEntry> &sourceEntries, MetaPage &meta) {
+        std::vector<LeafEntry> entries = sourceEntries;
+        sortLeafEntries(attribute, entries);
+
+        if (entries.empty()) {
+            return 0;
+        }
+
+        std::vector<Node> leaves;
+        Node currentLeaf;
+        currentLeaf.isLeaf = true;
+
+        for (const LeafEntry &entry: entries) {
+            currentLeaf.entries.push_back(entry);
+            if (!nodeFits(currentLeaf) && currentLeaf.entries.size() > 1) {
+                currentLeaf.entries.pop_back();
+                leaves.push_back(currentLeaf);
+
+                currentLeaf = Node{};
+                currentLeaf.isLeaf = true;
+                currentLeaf.entries.push_back(entry);
+            }
+        }
+        leaves.push_back(currentLeaf);
+
+        const PeterDB::PageNum firstLeafPage = handle.fileHandle.getNumberOfPages();
+        std::vector<LevelItem> level;
+        level.reserve(leaves.size());
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            leaves[i].nextLeaf = (i + 1 < leaves.size())
+                                 ? static_cast<PeterDB::PageNum>(firstLeafPage + i + 1)
+                                 : INVALID_PAGE;
+            PeterDB::PageNum pageNum;
+            if (appendNode(handle, leaves[i], pageNum) != 0) return -1;
+            level.push_back({pageNum, leaves[i].entries.front().key});
+        }
+
+        uint32_t height = 0;
+        while (level.size() > 1) {
+            std::vector<Node> parents;
+            std::vector<std::vector<char> > parentFirstKeys;
+
+            Node parent;
+            parent.isLeaf = false;
+            std::vector<char> parentFirstKey;
+
+            for (const LevelItem &child: level) {
+                if (parent.children.empty()) {
+                    parent.children.push_back(child.page);
+                    parentFirstKey = child.firstKey;
+                    continue;
+                }
+
+                parent.children.push_back(child.page);
+                parent.keys.push_back(child.firstKey);
+
+                if (!nodeFits(parent) && parent.children.size() > 2) {
+                    parent.children.pop_back();
+                    parent.keys.pop_back();
+                    parents.push_back(parent);
+                    parentFirstKeys.push_back(parentFirstKey);
+
+                    parent = Node{};
+                    parent.isLeaf = false;
+                    parent.children.push_back(child.page);
+                    parentFirstKey = child.firstKey;
+                }
+            }
+
+            if (!parent.children.empty()) {
+                parents.push_back(parent);
+                parentFirstKeys.push_back(parentFirstKey);
+            }
+
+            std::vector<LevelItem> nextLevel;
+            nextLevel.reserve(parents.size());
+            for (size_t i = 0; i < parents.size(); ++i) {
+                PeterDB::PageNum pageNum;
+                if (appendNode(handle, parents[i], pageNum) != 0) return -1;
+                nextLevel.push_back({pageNum, parentFirstKeys[i]});
+            }
+
+            level = nextLevel;
+            ++height;
+        }
+
+        meta.rootPage = level.front().page;
+        meta.height = height;
+        return writeMeta(handle, meta);
+    }
+
+    PeterDB::RC compactSmallTreeAfterDelete(PeterDB::IXFileHandle &handle, const PeterDB::Attribute &attribute,
+                                            MetaPage &meta) {
+        if (meta.height == 0) return 0;
+        if (handle.fileHandle.getNumberOfPages() > 256) return 0;
+
+        const size_t rebuildLimit = 64;
+        std::vector<LeafEntry> entries;
+        bool tooLarge = false;
+        if (collectSmallTreeEntries(handle, meta.rootPage, rebuildLimit, entries, tooLarge) != 0) return -1;
+        if (tooLarge || entries.empty()) return 0;
+
+        return rebuildCompactTree(handle, attribute, entries, meta);
+    }
+
     bool belowLow(const PeterDB::IX_ScanIterator &it, const std::vector<char> &key) {
         if (!it.hasLowKey) return false;
         const int cmp = compareKey(it.attribute, key, it.lowKey);
@@ -546,7 +682,8 @@ namespace PeterDB {
 
                 if (cmp == 0 && sameRid(it->rid, rid)) {
                     leaf.entries.erase(it);
-                    return writeNode(ixFileHandle, page, leaf);
+                    if (writeNode(ixFileHandle, page, leaf) != 0) return -1;
+                    return compactSmallTreeAfterDelete(ixFileHandle, attribute, meta);
                 }
             }
 
@@ -622,9 +759,24 @@ namespace PeterDB {
             Node leaf;
             if (readNode(*ixFileHandle, currentLeafPage, leaf) != 0 || !leaf.isLeaf) return IX_EOF;
 
-            for (size_t i = currentEntryIndex; i < leaf.entries.size(); ++i) {
+            size_t startIndex = currentEntryIndex;
+            if (hasLastReturned && currentLeafPage == lastLeafPage) {
+                bool foundLast = false;
+                for (size_t i = 0; i < leaf.entries.size(); ++i) {
+                    if (compareKey(attribute, leaf.entries[i].key, lastKey) == 0 &&
+                        sameRid(leaf.entries[i].rid, lastRid)) {
+                        startIndex = i + 1;
+                        foundLast = true;
+                        break;
+                    }
+                }
+                if (!foundLast && currentEntryIndex > 0) {
+                    startIndex = currentEntryIndex - 1;
+                }
+            }
+
+            for (size_t i = startIndex; i < leaf.entries.size(); ++i) {
                 const LeafEntry &entry = leaf.entries[i];
-                if (!afterLastReturned(*this, entry)) continue;
                 if (belowLow(*this, entry.key)) continue;
                 if (aboveHigh(*this, entry.key)) return IX_EOF;
 
@@ -632,8 +784,9 @@ namespace PeterDB {
                 copyKeyOut(attribute, entry.key, key);
                 lastKey = entry.key;
                 lastRid = entry.rid;
+                lastLeafPage = currentLeafPage;
                 hasLastReturned = true;
-                currentEntryIndex = static_cast<uint32_t>(i);
+                currentEntryIndex = static_cast<uint32_t>(i + 1);
                 return 0;
             }
 
@@ -651,6 +804,7 @@ namespace PeterDB {
         hasLowKey = false;
         hasHighKey = false;
         hasLastReturned = false;
+        lastLeafPage = INVALID_PAGE;
         currentLeafPage = INVALID_PAGE;
         currentEntryIndex = 0;
         isOpen = false;
