@@ -231,6 +231,53 @@ namespace {
 
         return 0;
     }
+
+    std::string aggregateOpToString(AggregateOp op) {
+        switch (op) {
+        case MIN: return "MIN";
+        case MAX: return "MAX";
+        case COUNT: return "COUNT";
+        case SUM: return "SUM";
+        case AVG: return "AVG";
+        default: return "UNKNOWN";
+        }
+    }
+
+    float getNumericValue(AttrType type, const void *data) {
+        if (type == TypeInt) {
+            int value = 0;
+            memcpy(&value, data, INT_SIZE);
+            return static_cast<float>(value);
+        }
+
+        float value = 0.0f;
+        memcpy(&value, data, REAL_SIZE);
+        return value;
+    }
+
+    std::string makeKeyString(AttrType type, const std::vector<char> &value) {
+        std::string key;
+        key.push_back(static_cast<char>(type));
+        key.append(value.data(), value.size());
+        return key;
+    }
+
+    std::vector<char> makeAggregateTuple(float value) {
+        std::vector<char> tuple(1 + REAL_SIZE, 0);
+        memcpy(tuple.data() + 1, &value, REAL_SIZE);
+        return tuple;
+    }
+
+    std::vector<char> makeGroupAggregateTuple(const std::vector<char> &groupValue, float aggValue) {
+        std::vector<char> tuple(1 + groupValue.size() + REAL_SIZE, 0);
+        unsigned offset = 1;
+        memcpy(tuple.data() + offset, groupValue.data(), groupValue.size());
+        offset += groupValue.size();
+        memcpy(tuple.data() + offset, &aggValue, REAL_SIZE);
+        return tuple;
+    }
+
+
 }
 
 namespace PeterDB {
@@ -395,22 +442,264 @@ namespace PeterDB {
     }
 
     Aggregate::Aggregate(Iterator *input, const Attribute &aggAttr, AggregateOp op) {
+        this->input = input;
+        this->aggAttr = aggAttr;
+        this->op = op;
 
+        this->isGroup = false;
+        this->computed = false;
+        this->returned = false;
+        this->basicResult = 0.0f;
+
+        this->inputAttrs.clear();
+        this->outputAttrs.clear();
+
+        if (this->input != nullptr) {
+            this->input->getAttributes(this->inputAttrs);
+        }
+
+        Attribute outAttr;
+        outAttr.name = aggregateOpToString(op) + "(" + aggAttr.name + ")";
+        outAttr.type = TypeReal;
+        outAttr.length = 4;
+        this->outputAttrs.push_back(outAttr);
     }
 
     Aggregate::Aggregate(Iterator *input, const Attribute &aggAttr, const Attribute &groupAttr, AggregateOp op) {
+        this->input = input;
+        this->aggAttr = aggAttr;
+        this->groupAttr = groupAttr;
+        this->op = op;
 
+        this->isGroup = true;
+        this->computed = false;
+        this->returned = false;
+        this->basicResult = 0.0f;
+
+        this->inputAttrs.clear();
+        this->outputAttrs.clear();
+
+        if (this->input != nullptr) {
+            this->input->getAttributes(this->inputAttrs);
+        }
+
+        this->outputAttrs.push_back(groupAttr);
+
+        Attribute aggOutAttr;
+        aggOutAttr.name = aggregateOpToString(op) + "(" + aggAttr.name + ")";
+        aggOutAttr.type = TypeReal;
+        aggOutAttr.length = 4;
+        this->outputAttrs.push_back(aggOutAttr);
     }
 
-    Aggregate::~Aggregate() {
+    Aggregate::~Aggregate() = default;
 
+    RC Aggregate::computeBasicAggregate() {
+        if (input == nullptr) {
+            basicResult = 0.0f;
+            return 0;
+        }
+
+        void *tuple = malloc(PAGE_SIZE);
+        if (tuple == nullptr) {
+            return -1;
+        }
+
+        bool hasValue = false;
+        float sum = 0.0f;
+        float minValue = 0.0f;
+        float maxValue = 0.0f;
+        unsigned count = 0;
+
+        while (input->getNextTuple(tuple) != QE_EOF) {
+            Attribute foundAttr;
+            std::vector<char> value;
+
+            if (!getAttrValue(inputAttrs, tuple, aggAttr.name, foundAttr, value)) {
+                continue;
+            }
+
+            float numericValue = getNumericValue(foundAttr.type, value.data());
+
+            if (!hasValue) {
+                minValue = numericValue;
+                maxValue = numericValue;
+                hasValue = true;
+            }
+
+            if (numericValue < minValue) {
+                minValue = numericValue;
+            }
+
+            if (numericValue > maxValue) {
+                maxValue = numericValue;
+            }
+
+            sum += numericValue;
+            count++;
+        }
+
+        free(tuple);
+
+        switch (op) {
+            case MIN:
+                basicResult = hasValue ? minValue : 0.0f;
+                break;
+            case MAX:
+                basicResult = hasValue ? maxValue : 0.0f;
+                break;
+            case COUNT:
+                basicResult = static_cast<float>(count);
+                break;
+            case SUM:
+                basicResult = sum;
+                break;
+            case AVG:
+                basicResult = count == 0 ? 0.0f : sum / static_cast<float>(count);
+                break;
+            default:
+                basicResult = 0.0f;
+                break;
+        }
+
+        return 0;
+    }
+
+    RC Aggregate::computeGroupAggregate() {
+        if (input == nullptr) {
+            return 0;
+        }
+
+        struct AggState {
+            std::vector<char> groupValue;
+            bool hasValue = false;
+            float sum = 0.0f;
+            float minValue = 0.0f;
+            float maxValue = 0.0f;
+            unsigned count = 0;
+        };
+
+        std::unordered_map<std::string, AggState> groups;
+
+        void *tuple = malloc(PAGE_SIZE);
+        if (tuple == nullptr) {
+            return -1;
+        }
+
+        while (input->getNextTuple(tuple) != QE_EOF) {
+            Attribute foundGroupAttr;
+            Attribute foundAggAttr;
+            std::vector<char> groupValue;
+            std::vector<char> aggValue;
+
+            if (!getAttrValue(inputAttrs, tuple, groupAttr.name, foundGroupAttr, groupValue)) {
+                continue;
+            }
+
+            if (!getAttrValue(inputAttrs, tuple, aggAttr.name, foundAggAttr, aggValue)) {
+                continue;
+            }
+
+            std::string key = makeKeyString(foundGroupAttr.type, groupValue);
+            AggState &state = groups[key];
+
+            if (state.groupValue.empty()) {
+                state.groupValue = groupValue;
+            }
+
+            float numericValue = getNumericValue(foundAggAttr.type, aggValue.data());
+
+            if (!state.hasValue) {
+                state.minValue = numericValue;
+                state.maxValue = numericValue;
+                state.hasValue = true;
+            }
+
+            if (numericValue < state.minValue) {
+                state.minValue = numericValue;
+            }
+
+            if (numericValue > state.maxValue) {
+                state.maxValue = numericValue;
+            }
+
+            state.sum += numericValue;
+            state.count++;
+        }
+
+        free(tuple);
+
+        for (auto &entry : groups) {
+            AggState &state = entry.second;
+
+            float result = 0.0f;
+
+            switch (op) {
+                case MIN:
+                    result = state.hasValue ? state.minValue : 0.0f;
+                    break;
+                case MAX:
+                    result = state.hasValue ? state.maxValue : 0.0f;
+                    break;
+                case COUNT:
+                    result = static_cast<float>(state.count);
+                    break;
+                case SUM:
+                    result = state.sum;
+                    break;
+                case AVG:
+                    result = state.count == 0 ? 0.0f : state.sum / static_cast<float>(state.count);
+                    break;
+                default:
+                    result = 0.0f;
+                    break;
+            }
+
+            groupResults.push(makeGroupAggregateTuple(state.groupValue, result));
+        }
+
+        return 0;
     }
 
     RC Aggregate::getNextTuple(void *data) {
-        return -1;
+        if (data == nullptr) {
+            return QE_EOF;
+        }
+
+        if (!computed) {
+            RC rc = isGroup ? computeGroupAggregate() : computeBasicAggregate();
+            if (rc != 0) {
+                return QE_EOF;
+            }
+            computed = true;
+        }
+
+        if (!isGroup) {
+            if (returned) {
+                return QE_EOF;
+            }
+
+            std::vector<char> tuple = makeAggregateTuple(basicResult);
+            memcpy(data, tuple.data(), tuple.size());
+            returned = true;
+            return 0;
+        }
+
+        if (groupResults.empty()) {
+            return QE_EOF;
+        }
+
+        std::vector<char> tuple = groupResults.front();
+        groupResults.pop();
+
+        memcpy(data, tuple.data(), tuple.size());
+        return 0;
     }
 
     RC Aggregate::getAttributes(std::vector<Attribute> &attrs) const {
-        return -1;
+        attrs.clear();
+        attrs = this->outputAttrs;
+        return 0;
     }
+
 } // namespace PeterDB
