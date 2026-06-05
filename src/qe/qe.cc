@@ -277,7 +277,52 @@ namespace {
         return tuple;
     }
 
+    std::vector<char> copyTupleToVector(const std::vector<Attribute> &attrs, const void *tuple) {
+        unsigned size = getTupleSize(attrs, tuple);
+        const char *input = static_cast<const char *>(tuple);
+        return std::vector<char>(input, input + size);
+    }
 
+    std::vector<char> mergeTuples(const std::vector<Attribute> &leftAttrs,
+                                  const void *leftTuple,
+                                  const std::vector<Attribute> &rightAttrs,
+                                  const void *rightTuple) {
+        unsigned totalAttrs = leftAttrs.size() + rightAttrs.size();
+        unsigned outputNullSize = getNullIndicatorSize(totalAttrs);
+
+        std::vector<char> output(PAGE_SIZE, 0);
+        unsigned outputOffset = outputNullSize;
+
+        for (unsigned i = 0; i < leftAttrs.size(); i++) {
+            Attribute attr;
+            std::vector<char> value;
+
+            if (!getAttrValue(leftAttrs, leftTuple, leftAttrs[i].name, attr, value)) {
+                output[i / 8] |= static_cast<char>(1 << (7 - (i % 8)));
+                continue;
+            }
+
+            memcpy(output.data() + outputOffset, value.data(), value.size());
+            outputOffset += value.size();
+        }
+
+        for (unsigned i = 0; i < rightAttrs.size(); i++) {
+            Attribute attr;
+            std::vector<char> value;
+            unsigned outputIndex = leftAttrs.size() + i;
+
+            if (!getAttrValue(rightAttrs, rightTuple, rightAttrs[i].name, attr, value)) {
+                output[outputIndex / 8] |= static_cast<char>(1 << (7 - (outputIndex % 8)));
+                continue;
+            }
+
+            memcpy(output.data() + outputOffset, value.data(), value.size());
+            outputOffset += value.size();
+        }
+
+        output.resize(outputOffset);
+        return output;
+    }
 }
 
 namespace PeterDB {
@@ -395,11 +440,123 @@ namespace PeterDB {
     BNLJoin::~BNLJoin() = default;
 
     RC BNLJoin::loadNextLeftBlock() {
-        return QE_EOF;
+        hashTable.clear();
+
+        if (leftIn == nullptr || leftExhausted) {
+            return QE_EOF;
+        }
+
+        unsigned maxBytes = numPages * PAGE_SIZE;
+        unsigned usedBytes = 0;
+
+        void *tuple = malloc(PAGE_SIZE);
+        if (tuple == nullptr) {
+            return QE_EOF;
+        }
+
+        while (usedBytes < maxBytes && leftIn->getNextTuple(tuple) != QE_EOF) {
+            Attribute keyAttr;
+            std::vector<char> keyValue;
+
+            if (!getAttrValue(leftAttrs, tuple, condition.lhsAttr, keyAttr, keyValue)) {
+                continue;
+            }
+
+            std::vector<char> tupleVec = copyTupleToVector(leftAttrs, tuple);
+            usedBytes += tupleVec.size();
+
+            std::string key = makeKeyString(keyAttr.type, keyValue);
+            hashTable[key].push_back(tupleVec);
+
+            if (usedBytes >= maxBytes) {
+                break;
+            }
+        }
+
+        free(tuple);
+
+        if (hashTable.empty()) {
+            leftExhausted = true;
+            return QE_EOF;
+        }
+
+        if (rightIn != nullptr) {
+            rightIn->setIterator();
+        }
+
+        blockLoaded = true;
+        return 0;
     }
 
     RC BNLJoin::getNextTuple(void *data) {
-        return QE_EOF;
+        if (data == nullptr || leftIn == nullptr || rightIn == nullptr) {
+            return QE_EOF;
+        }
+
+        while (true) {
+            if (!outputQueue.empty()) {
+                std::vector<char> result = outputQueue.front();
+                outputQueue.pop();
+
+                memcpy(data, result.data(), result.size());
+                return 0;
+            }
+
+            if (!blockLoaded) {
+                if (loadNextLeftBlock() == QE_EOF) {
+                    return QE_EOF;
+                }
+            }
+
+            void *rightTuple = malloc(PAGE_SIZE);
+            if (rightTuple == nullptr) {
+                return QE_EOF;
+            }
+
+            bool foundAnyRight = false;
+
+            while (rightIn->getNextTuple(rightTuple) != QE_EOF) {
+                foundAnyRight = true;
+
+                Attribute rightKeyAttr;
+                std::vector<char> rightKeyValue;
+
+                if (!getAttrValue(rightAttrs, rightTuple, condition.rhsAttr, rightKeyAttr, rightKeyValue)) {
+                    continue;
+                }
+
+                std::string key = makeKeyString(rightKeyAttr.type, rightKeyValue);
+                auto it = hashTable.find(key);
+
+                if (it == hashTable.end()) {
+                    continue;
+                }
+
+                for (const std::vector<char> &leftTuple : it->second) {
+                    std::vector<char> result = mergeTuples(leftAttrs,
+                                                           leftTuple.data(),
+                                                           rightAttrs,
+                                                           rightTuple);
+                    outputQueue.push(result);
+                }
+
+                if (!outputQueue.empty()) {
+                    break;
+                }
+            }
+
+            free(rightTuple);
+
+            if (!outputQueue.empty()) {
+                continue;
+            }
+
+            blockLoaded = false;
+
+            if (!foundAnyRight) {
+                return QE_EOF;
+            }
+        }
     }
 
     RC BNLJoin::getAttributes(std::vector<Attribute> &attrs) const {
