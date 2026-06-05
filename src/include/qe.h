@@ -4,6 +4,11 @@
 #include <vector>
 #include <string>
 #include <limits>
+#include <unordered_map>
+#include <queue>
+#include <cstring>
+#include <cmath>
+
 
 #include "rm.h"
 #include "ix.h"
@@ -158,34 +163,57 @@ namespace PeterDB {
     };
 
     class Filter : public Iterator {
-        // Filter operator
+    private:
+        Iterator *input;
+        Condition condition;
+        std::vector<Attribute> attrs;
+
     public:
-        Filter(Iterator *input,               // Iterator of input R
-               const Condition &condition     // Selection condition
-        );
+        Filter(Iterator *input, const Condition &condition);
 
         ~Filter() override;
 
         RC getNextTuple(void *data) override;
 
-        // For attribute in std::vector<Attribute>, name it as rel.attr
         RC getAttributes(std::vector<Attribute> &attrs) const override;
     };
 
     class Project : public Iterator {
-        // Projection operator
+    private:
+        Iterator *input;
+        std::vector<std::string> attrNames;
+        std::vector<Attribute> inputAttrs;
+        std::vector<Attribute> outputAttrs;
+
     public:
-        Project(Iterator *input,                                // Iterator of input R
-                const std::vector<std::string> &attrNames);     // std::vector containing attribute names
+        Project(Iterator *input, const std::vector<std::string> &attrNames);
+
         ~Project() override;
 
         RC getNextTuple(void *data) override;
 
-        // For attribute in std::vector<Attribute>, name it as rel.attr
         RC getAttributes(std::vector<Attribute> &attrs) const override;
     };
 
     class BNLJoin : public Iterator {
+    private:
+        Iterator *leftIn;
+        TableScan *rightIn;
+        Condition condition;
+        unsigned numPages;
+
+        std::vector<Attribute> leftAttrs;
+        std::vector<Attribute> rightAttrs;
+        std::vector<Attribute> outputAttrs;
+
+        bool leftExhausted;
+        bool blockLoaded;
+
+        std::unordered_map<std::string, std::vector<std::vector<char>>> hashTable;
+        std::queue<std::vector<char>> outputQueue;
+
+        RC loadNextLeftBlock();
+
         // Block nested-loop join operator
     public:
         BNLJoin(Iterator *leftIn,            // Iterator of input R
@@ -204,6 +232,18 @@ namespace PeterDB {
     };
 
     class INLJoin : public Iterator {
+    private:
+        Iterator *leftIn;
+        IndexScan *rightIn;
+        Condition condition;
+
+        std::vector<Attribute> leftAttrs;
+        std::vector<Attribute> rightAttrs;
+        std::vector<Attribute> outputAttrs;
+
+        std::vector<char> currentLeftTuple;
+        bool hasCurrentLeft;
+
         // Index nested-loop join operator
     public:
         INLJoin(Iterator *leftIn,           // Iterator of input R
@@ -221,6 +261,21 @@ namespace PeterDB {
 
     // 10 extra-credit points
     class GHJoin : public Iterator {
+    private:
+        Iterator *leftIn;
+        Iterator *rightIn;
+        Condition condition;
+        unsigned numPartitions;
+
+        std::vector<Attribute> leftAttrs;
+        std::vector<Attribute> rightAttrs;
+        std::vector<Attribute> outputAttrs;
+
+        bool built;
+        std::queue<std::vector<char>> outputQueue;
+
+        RC buildJoinResults();
+
         // Grace hash join operator
     public:
         GHJoin(Iterator *leftIn,               // Iterator of input R
@@ -238,6 +293,26 @@ namespace PeterDB {
     };
 
     class Aggregate : public Iterator {
+    private:
+        Iterator *input;
+        Attribute aggAttr;
+        Attribute groupAttr;
+        AggregateOp op;
+
+        bool isGroup;
+        bool computed;
+        bool returned;
+
+        std::vector<Attribute> inputAttrs;
+        std::vector<Attribute> outputAttrs;
+
+        float basicResult;
+        std::queue<std::vector<char>> groupResults;
+
+        RC computeBasicAggregate();
+        RC computeGroupAggregate();
+
+
         // Aggregation operator
     public:
         // Mandatory
