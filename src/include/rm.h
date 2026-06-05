@@ -9,6 +9,9 @@
 namespace PeterDB {
 #define RM_EOF (-1)  // end of a scan operator
 
+
+    class IXFileHandle;
+    class IX_ScanIterator;
     // RM_ScanIterator is an iterator to go through tuples
     class RM_ScanIterator {
     public:
@@ -35,7 +38,17 @@ namespace PeterDB {
         // "key" follows the same format as in IndexManager::insertEntry()
         RC getNextEntry(RID &rid, void *key);    // Get next matching entry
         RC close();                              // Terminate index scan
+
+    private:
+        friend class RelationManager;
+
+        IXFileHandle *ixFileHandle = nullptr;
+        IX_ScanIterator *ixScanIterator = nullptr;
+        Attribute attribute;
+        bool isOpen = false;
     };
+
+
 
     // Relation Manager
     class RelationManager {
