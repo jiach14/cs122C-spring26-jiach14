@@ -92,6 +92,7 @@ namespace PeterDB {
         uint32_t currentEntryIndex = 0;
         std::vector<char> lastKey;
         RID lastRid{};
+        PageNum lastLeafPage = std::numeric_limits<PageNum>::max();
         bool hasLastReturned = false;
         bool isOpen = false;
     };
