@@ -266,6 +266,136 @@ namespace {
         return nullIndicator[0] & static_cast<unsigned char>(1 << 7);
     }
 
+    void setNullBit(void *data, uint32_t i) {
+        auto *nullIndicator = static_cast<unsigned char *>(data);
+        nullIndicator[i / 8] |= static_cast<unsigned char>(1 << (7 - (i % 8)));
+    }
+
+    uint32_t getApiFieldSize(const Attribute &attr, const char *ptr) {
+        if (attr.type == TypeInt || attr.type == TypeReal) {
+            return INT_SIZE;
+        }
+
+        uint32_t length = 0;
+        memcpy(&length, ptr, INT_SIZE);
+        return INT_SIZE + length;
+    }
+
+    std::vector<char> projectApiTuple(const std::vector<Attribute> &oldAttrs,
+                                      const void *oldTuple,
+                                      const std::vector<uint32_t> &indices,
+                                      uint32_t extraNullFields) {
+        uint32_t outputFieldCount = static_cast<uint32_t>(indices.size()) + extraNullFields;
+        uint32_t outputNullBytes = getNullIndicatorSize(outputFieldCount);
+        std::vector<char> output(PAGE_SIZE, 0);
+        uint32_t outputOffset = outputNullBytes;
+
+        const char *input = static_cast<const char *>(oldTuple);
+        const auto *oldNulls = reinterpret_cast<const unsigned char *>(input);
+        uint32_t inputOffset = getNullIndicatorSize(static_cast<uint32_t>(oldAttrs.size()));
+        uint32_t outputIndex = 0;
+
+        for (uint32_t i = 0; i < oldAttrs.size(); i++) {
+            bool isNull = fieldIsNull(oldNulls, i);
+            uint32_t fieldSize = 0;
+
+            if (!isNull) {
+                fieldSize = getApiFieldSize(oldAttrs[i], input + inputOffset);
+            }
+
+            if (std::find(indices.begin(), indices.end(), i) != indices.end()) {
+                if (isNull) {
+                    setNullBit(output.data(), outputIndex);
+                } else {
+                    memcpy(output.data() + outputOffset, input + inputOffset, fieldSize);
+                    outputOffset += fieldSize;
+                }
+
+                outputIndex++;
+            }
+
+            if (!isNull) {
+                inputOffset += fieldSize;
+            }
+        }
+
+        for (uint32_t i = 0; i < extraNullFields; i++) {
+            setNullBit(output.data(), outputIndex + i);
+        }
+
+        output.resize(outputOffset);
+        return output;
+    }
+
+    RC replaceColumnsForTable(int32_t tableId, const std::vector<Attribute> &attrs) {
+        RecordBasedFileManager &rbfm = RecordBasedFileManager::instance();
+
+        FileHandle columnsFileHandle;
+        if (rbfm.openFile(COLUMNS_TABLE_NAME, columnsFileHandle) != 0) {
+            return -1;
+        }
+
+        void *value = malloc(PAGE_SIZE);
+        void *data = malloc(PAGE_SIZE);
+        if (value == nullptr || data == nullptr) {
+            free(value);
+            free(data);
+            rbfm.closeFile(columnsFileHandle);
+            return -1;
+        }
+
+        memcpy(value, &tableId, INT_SIZE);
+
+        RBFM_ScanIterator iterator;
+        if (rbfm.scan(columnsFileHandle,
+                      getColumnsDescriptor(),
+                      "table-id",
+                      EQ_OP,
+                      value,
+                      {"column-position"},
+                      iterator) != 0) {
+            free(value);
+            free(data);
+            rbfm.closeFile(columnsFileHandle);
+            return -1;
+        }
+
+        RID rid{};
+        while (iterator.getNextRecord(rid, data) != RBFM_EOF) {
+            if (rbfm.deleteRecord(columnsFileHandle, getColumnsDescriptor(), rid) != 0) {
+                iterator.close();
+                free(value);
+                free(data);
+                rbfm.closeFile(columnsFileHandle);
+                return -1;
+            }
+        }
+        iterator.close();
+
+        for (uint32_t i = 0; i < attrs.size(); i++) {
+            uint32_t recordSize = 0;
+            prepareColumnsRecord(tableId,
+                                 attrs[i].name,
+                                 attrs[i].type,
+                                 attrs[i].length,
+                                 static_cast<int32_t>(i + 1),
+                                 data,
+                                 recordSize);
+
+            if (rbfm.insertRecord(columnsFileHandle, getColumnsDescriptor(), data, rid) != 0) {
+                free(value);
+                free(data);
+                rbfm.closeFile(columnsFileHandle);
+                return -1;
+            }
+        }
+
+        free(value);
+        free(data);
+
+        return rbfm.closeFile(columnsFileHandle);
+    }
+
     RC insertIndexEntryIfExists(const std::string &tableName,
                                 const Attribute &attr,
                                 const RID &rid) {
@@ -1044,12 +1174,181 @@ namespace PeterDB {
 
     // Extra credit work
     RC RelationManager::dropAttribute(const std::string &tableName, const std::string &attributeName) {
-        return -1;
+        if (tableName.empty() || attributeName.empty() || isSystemTable(tableName)) {
+            return -1;
+        }
+
+        std::vector<Attribute> oldAttrs;
+        if (getAttributes(tableName, oldAttrs) != 0) {
+            return -1;
+        }
+
+        int targetIndex = -1;
+        for (uint32_t i = 0; i < oldAttrs.size(); i++) {
+            if (oldAttrs[i].name == attributeName) {
+                targetIndex = static_cast<int>(i);
+                break;
+            }
+        }
+
+        if (targetIndex < 0 || oldAttrs.size() <= 1) {
+            return -1;
+        }
+
+        std::vector<Attribute> newAttrs;
+        std::vector<uint32_t> projectedIndices;
+        for (uint32_t i = 0; i < oldAttrs.size(); i++) {
+            if (static_cast<int>(i) == targetIndex) {
+                continue;
+            }
+            newAttrs.push_back(oldAttrs[i]);
+            projectedIndices.push_back(i);
+        }
+
+        int32_t tableId = 0;
+        std::string fileName;
+        if (getTableIdAndFileName(tableName, tableId, fileName) != 0) {
+            return -1;
+        }
+
+        RecordBasedFileManager &rbfm = RecordBasedFileManager::instance();
+        FileHandle fileHandle;
+        if (rbfm.openFile(fileName, fileHandle) != 0) {
+            return -1;
+        }
+
+        std::vector<std::string> oldAttrNames;
+        for (const Attribute &attr : oldAttrs) {
+            oldAttrNames.push_back(attr.name);
+        }
+
+        RBFM_ScanIterator iterator;
+        if (rbfm.scan(fileHandle, oldAttrs, "", NO_OP, nullptr, oldAttrNames, iterator) != 0) {
+            rbfm.closeFile(fileHandle);
+            return -1;
+        }
+
+        struct PendingUpdate {
+            RID rid;
+            std::vector<char> tuple;
+        };
+
+        std::vector<PendingUpdate> updates;
+        void *data = malloc(PAGE_SIZE);
+        if (data == nullptr) {
+            iterator.close();
+            rbfm.closeFile(fileHandle);
+            return -1;
+        }
+
+        RID rid{};
+        while (iterator.getNextRecord(rid, data) != RBFM_EOF) {
+            updates.push_back({rid, projectApiTuple(oldAttrs, data, projectedIndices, 0)});
+        }
+
+        free(data);
+        iterator.close();
+
+        for (const PendingUpdate &update : updates) {
+            if (rbfm.updateRecord(fileHandle, newAttrs, update.tuple.data(), update.rid) != 0) {
+                rbfm.closeFile(fileHandle);
+                return -1;
+            }
+        }
+
+        if (rbfm.closeFile(fileHandle) != 0) {
+            return -1;
+        }
+
+        if (replaceColumnsForTable(tableId, newAttrs) != 0) {
+            return -1;
+        }
+
+        IndexManager::instance().destroyFile(getIndexFileName(tableName, attributeName));
+        return 0;
     }
 
     // Extra credit work
     RC RelationManager::addAttribute(const std::string &tableName, const Attribute &attr) {
-        return -1;
+        if (tableName.empty() || attr.name.empty() || isSystemTable(tableName)) {
+            return -1;
+        }
+
+        std::vector<Attribute> oldAttrs;
+        if (getAttributes(tableName, oldAttrs) != 0) {
+            return -1;
+        }
+
+        for (const Attribute &existingAttr : oldAttrs) {
+            if (existingAttr.name == attr.name) {
+                return -1;
+            }
+        }
+
+        std::vector<Attribute> newAttrs = oldAttrs;
+        newAttrs.push_back(attr);
+
+        std::vector<uint32_t> projectedIndices;
+        for (uint32_t i = 0; i < oldAttrs.size(); i++) {
+            projectedIndices.push_back(i);
+        }
+
+        int32_t tableId = 0;
+        std::string fileName;
+        if (getTableIdAndFileName(tableName, tableId, fileName) != 0) {
+            return -1;
+        }
+
+        RecordBasedFileManager &rbfm = RecordBasedFileManager::instance();
+        FileHandle fileHandle;
+        if (rbfm.openFile(fileName, fileHandle) != 0) {
+            return -1;
+        }
+
+        std::vector<std::string> oldAttrNames;
+        for (const Attribute &oldAttr : oldAttrs) {
+            oldAttrNames.push_back(oldAttr.name);
+        }
+
+        RBFM_ScanIterator iterator;
+        if (rbfm.scan(fileHandle, oldAttrs, "", NO_OP, nullptr, oldAttrNames, iterator) != 0) {
+            rbfm.closeFile(fileHandle);
+            return -1;
+        }
+
+        struct PendingUpdate {
+            RID rid;
+            std::vector<char> tuple;
+        };
+
+        std::vector<PendingUpdate> updates;
+        void *data = malloc(PAGE_SIZE);
+        if (data == nullptr) {
+            iterator.close();
+            rbfm.closeFile(fileHandle);
+            return -1;
+        }
+
+        RID rid{};
+        while (iterator.getNextRecord(rid, data) != RBFM_EOF) {
+            updates.push_back({rid, projectApiTuple(oldAttrs, data, projectedIndices, 1)});
+        }
+
+        free(data);
+        iterator.close();
+
+        for (const PendingUpdate &update : updates) {
+            if (rbfm.updateRecord(fileHandle, newAttrs, update.tuple.data(), update.rid) != 0) {
+                rbfm.closeFile(fileHandle);
+                return -1;
+            }
+        }
+
+        if (rbfm.closeFile(fileHandle) != 0) {
+            return -1;
+        }
+
+        return replaceColumnsForTable(tableId, newAttrs);
     }
 
     // QE IX related

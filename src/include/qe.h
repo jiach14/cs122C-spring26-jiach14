@@ -54,6 +54,7 @@ namespace PeterDB {
         RelationManager &rm;
         RM_ScanIterator iter;
         std::string tableName;
+        std::string aliasName;
         std::vector<Attribute> attrs;
         std::vector<std::string> attrNames;
         RID rid;
@@ -61,6 +62,7 @@ namespace PeterDB {
         TableScan(RelationManager &rm, const std::string &tableName, const char *alias = NULL) : rm(rm) {
             //Set members
             this->tableName = tableName;
+            this->aliasName = alias ? alias : tableName;
 
             // Get Attributes from RM
             rm.getAttributes(tableName, attrs);
@@ -73,9 +75,6 @@ namespace PeterDB {
 
             // Call RM scan to get an iterator
             rm.scan(tableName, "", NO_OP, NULL, attrNames, iter);
-
-            // Set alias
-            if (alias) this->tableName = alias;
         };
 
         // Start a new iterator given the new compOp and value
@@ -94,7 +93,7 @@ namespace PeterDB {
 
             // For attribute in std::vector<Attribute>, name it as rel.attr
             for (Attribute &attribute : attributes) {
-                attribute.name = tableName + "." + attribute.name;
+                attribute.name = aliasName + "." + attribute.name;
             }
             return 0;
         };
@@ -110,6 +109,7 @@ namespace PeterDB {
         RelationManager &rm;
         RM_IndexScanIterator iter;
         std::string tableName;
+        std::string aliasName;
         std::string attrName;
         std::vector<Attribute> attrs;
         char key[PAGE_SIZE];
@@ -119,6 +119,7 @@ namespace PeterDB {
                   const char *alias = NULL) : rm(rm) {
             // Set members
             this->tableName = tableName;
+            this->aliasName = alias ? alias : tableName;
             this->attrName = attrName;
 
             // Get Attributes from RM
@@ -126,9 +127,6 @@ namespace PeterDB {
 
             // Call rm indexScan to get iterator
             rm.indexScan(tableName, attrName, NULL, NULL, true, true, iter);
-
-            // Set alias
-            if (alias) this->tableName = alias;
         };
 
         // Start a new iterator given the new key range
@@ -152,7 +150,7 @@ namespace PeterDB {
 
             // For attribute in std::vector<Attribute>, name it as rel.attr
             for (Attribute &attribute : attributes) {
-                attribute.name = tableName + "." + attribute.name;
+                attribute.name = aliasName + "." + attribute.name;
             }
 	    return 0;
         };
@@ -272,6 +270,7 @@ namespace PeterDB {
         std::vector<Attribute> outputAttrs;
 
         bool built;
+        std::vector<std::string> tempFileNames;
         std::queue<std::vector<char>> outputQueue;
 
         RC buildJoinResults();

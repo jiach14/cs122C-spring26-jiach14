@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -323,6 +324,50 @@ namespace {
         output.resize(outputOffset);
         return output;
     }
+
+    unsigned nextGHJoinId() {
+        static unsigned id = 0;
+        return ++id;
+    }
+
+    RC createTempPartitionFiles(unsigned joinId,
+                                unsigned numPartitions,
+                                std::vector<std::string> &tempFileNames) {
+        PagedFileManager &pfm = PagedFileManager::instance();
+        tempFileNames.clear();
+
+        for (unsigned i = 0; i < numPartitions; i++) {
+            for (const char *side : {"left", "right"}) {
+                std::ostringstream name;
+                name << side << "_join" << joinId << "_" << i;
+
+                const std::string fileName = name.str();
+                pfm.destroyFile(fileName);
+
+                if (pfm.createFile(fileName) != 0) {
+                    for (const std::string &createdFile : tempFileNames) {
+                        pfm.destroyFile(createdFile);
+                    }
+                    tempFileNames.clear();
+                    return -1;
+                }
+
+                tempFileNames.push_back(fileName);
+            }
+        }
+
+        return 0;
+    }
+
+    void destroyTempPartitionFiles(std::vector<std::string> &tempFileNames) {
+        PagedFileManager &pfm = PagedFileManager::instance();
+
+        for (const std::string &fileName : tempFileNames) {
+            pfm.destroyFile(fileName);
+        }
+
+        tempFileNames.clear();
+    }
 }
 
 namespace PeterDB {
@@ -567,35 +612,217 @@ namespace PeterDB {
 
 
     INLJoin::INLJoin(Iterator *leftIn, IndexScan *rightIn, const Condition &condition) {
+        this->leftIn = leftIn;
+        this->rightIn = rightIn;
+        this->condition = condition;
+        this->hasCurrentLeft = false;
+        this->currentLeftTuple.clear();
 
+        if (this->leftIn != nullptr) {
+            this->leftIn->getAttributes(this->leftAttrs);
+        }
+
+        if (this->rightIn != nullptr) {
+            this->rightIn->getAttributes(this->rightAttrs);
+        }
+
+        this->outputAttrs.clear();
+        this->outputAttrs.insert(this->outputAttrs.end(), this->leftAttrs.begin(), this->leftAttrs.end());
+        this->outputAttrs.insert(this->outputAttrs.end(), this->rightAttrs.begin(), this->rightAttrs.end());
     }
 
-    INLJoin::~INLJoin() {
-
-    }
+    INLJoin::~INLJoin() = default;
 
     RC INLJoin::getNextTuple(void *data) {
-        return -1;
+        if (data == nullptr || leftIn == nullptr || rightIn == nullptr) {
+            return QE_EOF;
+        }
+
+        void *rightTuple = malloc(PAGE_SIZE);
+        if (rightTuple == nullptr) {
+            return QE_EOF;
+        }
+
+        while (true) {
+            if (!hasCurrentLeft) {
+                void *leftTuple = malloc(PAGE_SIZE);
+                if (leftTuple == nullptr) {
+                    free(rightTuple);
+                    return QE_EOF;
+                }
+
+                if (leftIn->getNextTuple(leftTuple) == QE_EOF) {
+                    free(leftTuple);
+                    free(rightTuple);
+                    return QE_EOF;
+                }
+
+                Attribute keyAttr;
+                std::vector<char> keyValue;
+
+                if (!getAttrValue(leftAttrs, leftTuple, condition.lhsAttr, keyAttr, keyValue)) {
+                    free(leftTuple);
+                    continue;
+                }
+
+                currentLeftTuple = copyTupleToVector(leftAttrs, leftTuple);
+                free(leftTuple);
+
+                switch (condition.op) {
+                    case EQ_OP:
+                        rightIn->setIterator(keyValue.data(), keyValue.data(), true, true);
+                        break;
+                    case LT_OP:
+                        rightIn->setIterator(keyValue.data(), nullptr, false, true);
+                        break;
+                    case LE_OP:
+                        rightIn->setIterator(keyValue.data(), nullptr, true, true);
+                        break;
+                    case GT_OP:
+                        rightIn->setIterator(nullptr, keyValue.data(), true, false);
+                        break;
+                    case GE_OP:
+                        rightIn->setIterator(nullptr, keyValue.data(), true, true);
+                        break;
+                    case NE_OP:
+                    case NO_OP:
+                    default:
+                        rightIn->setIterator(nullptr, nullptr, true, true);
+                        break;
+                }
+
+                hasCurrentLeft = true;
+            }
+
+            while (rightIn->getNextTuple(rightTuple) != QE_EOF) {
+                std::vector<char> result = mergeTuples(leftAttrs,
+                                                       currentLeftTuple.data(),
+                                                       rightAttrs,
+                                                       rightTuple);
+
+                if (!tupleSatisfiesCondition(outputAttrs, result.data(), condition)) {
+                    continue;
+                }
+
+                memcpy(data, result.data(), result.size());
+                free(rightTuple);
+                return 0;
+            }
+
+            hasCurrentLeft = false;
+        }
     }
 
     RC INLJoin::getAttributes(std::vector<Attribute> &attrs) const {
-        return -1;
+        attrs.clear();
+        attrs = this->outputAttrs;
+        return 0;
     }
 
     GHJoin::GHJoin(Iterator *leftIn, Iterator *rightIn, const Condition &condition, const unsigned int numPartitions) {
+        this->leftIn = leftIn;
+        this->rightIn = rightIn;
+        this->condition = condition;
+        this->numPartitions = numPartitions;
+        this->built = false;
 
+        if (this->leftIn != nullptr) {
+            this->leftIn->getAttributes(this->leftAttrs);
+        }
+
+        if (this->rightIn != nullptr) {
+            this->rightIn->getAttributes(this->rightAttrs);
+        }
+
+        this->outputAttrs.clear();
+        this->outputAttrs.insert(this->outputAttrs.end(), this->leftAttrs.begin(), this->leftAttrs.end());
+        this->outputAttrs.insert(this->outputAttrs.end(), this->rightAttrs.begin(), this->rightAttrs.end());
+
+        createTempPartitionFiles(nextGHJoinId(), this->numPartitions, this->tempFileNames);
     }
 
     GHJoin::~GHJoin() {
-
+        destroyTempPartitionFiles(this->tempFileNames);
     }
 
     RC GHJoin::getNextTuple(void *data) {
-        return -1;
+        if (data == nullptr) {
+            return QE_EOF;
+        }
+
+        if (!built) {
+            if (buildJoinResults() != 0) {
+                built = true;
+                return QE_EOF;
+            }
+            built = true;
+        }
+
+        if (outputQueue.empty()) {
+            return QE_EOF;
+        }
+
+        std::vector<char> result = outputQueue.front();
+        outputQueue.pop();
+        memcpy(data, result.data(), result.size());
+        return 0;
     }
 
     RC GHJoin::getAttributes(std::vector<Attribute> &attrs) const {
-        return -1;
+        attrs.clear();
+        attrs = this->outputAttrs;
+        return 0;
+    }
+
+    RC GHJoin::buildJoinResults() {
+        if (leftIn == nullptr || rightIn == nullptr) {
+            return QE_EOF;
+        }
+
+        std::unordered_map<std::string, std::vector<std::vector<char>>> hashTable;
+
+        void *tuple = malloc(PAGE_SIZE);
+        if (tuple == nullptr) {
+            return -1;
+        }
+
+        while (leftIn->getNextTuple(tuple) != QE_EOF) {
+            Attribute keyAttr;
+            std::vector<char> keyValue;
+
+            if (!getAttrValue(leftAttrs, tuple, condition.lhsAttr, keyAttr, keyValue)) {
+                continue;
+            }
+
+            std::string key = makeKeyString(keyAttr.type, keyValue);
+            hashTable[key].push_back(copyTupleToVector(leftAttrs, tuple));
+        }
+
+        while (rightIn->getNextTuple(tuple) != QE_EOF) {
+            Attribute keyAttr;
+            std::vector<char> keyValue;
+
+            if (!getAttrValue(rightAttrs, tuple, condition.rhsAttr, keyAttr, keyValue)) {
+                continue;
+            }
+
+            std::string key = makeKeyString(keyAttr.type, keyValue);
+            auto it = hashTable.find(key);
+
+            if (it == hashTable.end()) {
+                continue;
+            }
+
+            for (const std::vector<char> &leftTuple : it->second) {
+                outputQueue.push(mergeTuples(leftAttrs,
+                                             leftTuple.data(),
+                                             rightAttrs,
+                                             tuple));
+            }
+        }
+
+        free(tuple);
+        return 0;
     }
 
     Aggregate::Aggregate(Iterator *input, const Attribute &aggAttr, AggregateOp op) {
